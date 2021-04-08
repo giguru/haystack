@@ -1,4 +1,4 @@
-from typing import Any, Optional, Dict, List
+from typing import Any, Optional, Dict, List, Union
 from uuid import uuid4
 import numpy as np
 from abc import abstractmethod
@@ -84,7 +84,7 @@ class Label:
                  is_correct_document: bool,
                  origin: str,
                  id: Optional[str] = None,
-                 document_id: Optional[str] = None,
+                 document_id: Optional[Union[str, List[str]]] = None,
                  offset_start_in_doc: Optional[int] = None,
                  no_answer: Optional[bool] = None,
                  model_id: Optional[int] = None,
