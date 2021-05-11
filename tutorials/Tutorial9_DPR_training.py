@@ -31,7 +31,7 @@ def tutorial9_dpr_training():
     query_model = "bert-base-uncased"
     passage_model = "bert-base-uncased"
 
-    save_dir = "../saved_models/dpr"
+    save_dir = "../query_resolution20210505_210357/dpr"
 
     # ## Option 2: Finetuning DPR
     #
