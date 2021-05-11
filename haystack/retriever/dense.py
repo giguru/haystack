@@ -37,6 +37,7 @@ class DensePassageRetriever(BaseRetriever):
                  document_store: BaseDocumentStore,
                  query_embedding_model: Union[Path, str] = "facebook/dpr-question_encoder-single-nq-base",
                  passage_embedding_model: Union[Path, str] = "facebook/dpr-ctx_encoder-single-nq-base",
+                 single_model_path: Optional[Union[Path, str]] = None,
                  model_version: Optional[str] = None,
                  max_seq_len_query: int = 64,
                  max_seq_len_passage: int = 256,
@@ -73,6 +74,9 @@ class DensePassageRetriever(BaseRetriever):
         :param passage_embedding_model: Local path or remote name of passage encoder checkpoint. The format equals the
                                         one used by hugging-face transformers' modelhub models
                                         Currently available remote names: ``"facebook/dpr-ctx_encoder-single-nq-base"``
+        :param single_model_path: Local path or remote name of a query and passage embedder in one single model. Those
+                                  models are typically trained within FARM.
+                                  Currently available remote names: TODO add FARM DPR model to HF modelhub
         :param model_version: The version of model to use from the HuggingFace model hub. Can be tag name, branch name, or commit hash.
         :param max_seq_len_query: Longest length of each query sequence. Maximum number of tokens for the query text. Longer ones will be cut down."
         :param max_seq_len_passage: Longest length of each passage/context sequence. Maximum number of tokens for the passage text. Longer ones will be cut down."
@@ -94,10 +98,18 @@ class DensePassageRetriever(BaseRetriever):
                              Can be helpful to disable in production deployments to keep the logs clean.
         """
 
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            document_store=document_store, query_embedding_model=query_embedding_model,
+            passage_embedding_model=passage_embedding_model, single_model_path=single_model_path,
+            model_version=model_version, max_seq_len_query=max_seq_len_query, max_seq_len_passage=max_seq_len_passage,
+            top_k=top_k, use_gpu=use_gpu, batch_size=batch_size, embed_title=embed_title,
+            use_fast_tokenizers=use_fast_tokenizers, infer_tokenizer_classes=infer_tokenizer_classes,
+            similarity_function=similarity_function, progress_bar=progress_bar,
+        )
+
         self.document_store = document_store
         self.batch_size = batch_size
-        self.max_seq_len_passage = max_seq_len_passage
-        self.max_seq_len_query = max_seq_len_query
         self.progress_bar = progress_bar
         self.top_k = top_k
 
@@ -115,7 +127,6 @@ class DensePassageRetriever(BaseRetriever):
         else:
             self.device = torch.device("cpu")
 
-        self.embed_title = embed_title
         self.infer_tokenizer_classes = infer_tokenizer_classes
         tokenizers_default_classes = {
             "query": "DPRQuestionEncoderTokenizer",
@@ -126,43 +137,52 @@ class DensePassageRetriever(BaseRetriever):
             tokenizers_default_classes["passage"] = None # type: ignore
 
         # Init & Load Encoders
-        self.query_tokenizer = Tokenizer.load(pretrained_model_name_or_path=query_embedding_model,
-                                              revision=model_version,
-                                              do_lower_case=True,
-                                              use_fast=use_fast_tokenizers,
-                                              tokenizer_class=tokenizers_default_classes["query"])
-        self.query_encoder = LanguageModel.load(pretrained_model_name_or_path=query_embedding_model,
-                                                revision=model_version,
-                                                language_model_class="DPRQuestionEncoder")
-        self.passage_tokenizer = Tokenizer.load(pretrained_model_name_or_path=passage_embedding_model,
-                                                revision=model_version,
-                                                do_lower_case=True,
-                                                use_fast=use_fast_tokenizers,
-                                                tokenizer_class=tokenizers_default_classes["passage"])
-        self.passage_encoder = LanguageModel.load(pretrained_model_name_or_path=passage_embedding_model,
+        if single_model_path is None:
+            self.query_tokenizer = Tokenizer.load(pretrained_model_name_or_path=query_embedding_model,
                                                   revision=model_version,
-                                                  language_model_class="DPRContextEncoder")
+                                                  do_lower_case=True,
+                                                  use_fast=use_fast_tokenizers,
+                                                  tokenizer_class=tokenizers_default_classes["query"])
+            self.query_encoder = LanguageModel.load(pretrained_model_name_or_path=query_embedding_model,
+                                                    revision=model_version,
+                                                    language_model_class="DPRQuestionEncoder")
+            self.passage_tokenizer = Tokenizer.load(pretrained_model_name_or_path=passage_embedding_model,
+                                                    revision=model_version,
+                                                    do_lower_case=True,
+                                                    use_fast=use_fast_tokenizers,
+                                                    tokenizer_class=tokenizers_default_classes["passage"])
+            self.passage_encoder = LanguageModel.load(pretrained_model_name_or_path=passage_embedding_model,
+                                                      revision=model_version,
+                                                      language_model_class="DPRContextEncoder")
 
-        self.processor = TextSimilarityProcessor(tokenizer=self.query_tokenizer,
-                                                 passage_tokenizer=self.passage_tokenizer,
-                                                 max_seq_len_passage=self.max_seq_len_passage,
-                                                 max_seq_len_query=self.max_seq_len_query,
-                                                 label_list=["hard_negative", "positive"],
-                                                 metric="text_similarity_metric",
-                                                 embed_title=self.embed_title,
-                                                 num_hard_negatives=0,
-                                                 num_positives=1)
+            self.processor = TextSimilarityProcessor(query_tokenizer=self.query_tokenizer,
+                                                     passage_tokenizer=self.passage_tokenizer,
+                                                     max_seq_len_passage=max_seq_len_passage,
+                                                     max_seq_len_query=max_seq_len_query,
+                                                     label_list=["hard_negative", "positive"],
+                                                     metric="text_similarity_metric",
+                                                     embed_title=embed_title,
+                                                     num_hard_negatives=0,
+                                                     num_positives=1)
+            prediction_head = TextSimilarityHead(similarity_function=similarity_function)
+            self.model = BiAdaptiveModel(
+                language_model1=self.query_encoder,
+                language_model2=self.passage_encoder,
+                prediction_heads=[prediction_head],
+                embeds_dropout_prob=0.1,
+                lm1_output_types=["per_sequence"],
+                lm2_output_types=["per_sequence"],
+                device=self.device,
+            )
+        else:
+            self.processor = TextSimilarityProcessor.load_from_dir(single_model_path)
+            self.processor.max_seq_len_passage = max_seq_len_passage
+            self.processor.max_seq_len_query = max_seq_len_query
+            self.processor.embed_title = embed_title
+            self.processor.num_hard_negatives = 0
+            self.processor.num_positives = 1  # during indexing of documents only one embedding is created
+            self.model = BiAdaptiveModel.load(single_model_path, device=self.device)
 
-        prediction_head = TextSimilarityHead(similarity_function=similarity_function)
-        self.model = BiAdaptiveModel(
-            language_model1=self.query_encoder,
-            language_model2=self.passage_encoder,
-            prediction_heads=[prediction_head],
-            embeds_dropout_prob=0.1,
-            lm1_output_types=["per_sequence"],
-            lm2_output_types=["per_sequence"],
-            device=self.device,
-        )
         self.model.connect_heads_with_processor(self.processor.tasks, require_labels=False)
 
     def retrieve(self, query: str, filters: dict = None, top_k: Optional[int] = None, index: str = None) -> List[Document]:
@@ -270,6 +290,8 @@ class DensePassageRetriever(BaseRetriever):
               train_filename: str,
               dev_filename: str = None,
               test_filename: str = None,
+              max_sample: int = None,
+              max_processes: int = 128,
               dev_split: float = 0,
               batch_size: int = 2,
               embed_title: bool = True,
@@ -295,6 +317,9 @@ class DensePassageRetriever(BaseRetriever):
         :param train_filename: training filename
         :param dev_filename: development set filename, file to be used by model in eval step of training
         :param test_filename: test set filename, file to be used by model in test step after training
+        :param max_sample: maximum number of input samples to convert. Can be used for debugging a smaller dataset.
+        :param max_processes: the maximum number of processes to spawn in the multiprocessing.Pool used in DataSilo.
+                              It can be set to 1 to disable the use of multiprocessing or make debugging easier.
         :param dev_split: The proportion of the train set that will sliced. Only works if dev_filename is set to None
         :param batch_size: total number of samples in 1 batch of data
         :param embed_title: whether to concatenate passage title with each passage. The default setting in official DPR embeds passage title with the corresponding passage
@@ -315,25 +340,19 @@ class DensePassageRetriever(BaseRetriever):
         :param passage_encoder_save_dir: directory inside save_dir where passage_encoder model files are saved
         """
 
-        self.embed_title = embed_title
-        self.processor = TextSimilarityProcessor(tokenizer=self.query_tokenizer,
-                                                 passage_tokenizer=self.passage_tokenizer,
-                                                 max_seq_len_passage=self.max_seq_len_passage,
-                                                 max_seq_len_query=self.max_seq_len_query,
-                                                 label_list=["hard_negative", "positive"],
-                                                 metric="text_similarity_metric",
-                                                 data_dir=data_dir,
-                                                 train_filename=train_filename,
-                                                 dev_filename=dev_filename,
-                                                 test_filename=test_filename,
-                                                 dev_split=dev_split,
-                                                 embed_title=self.embed_title,
-                                                 num_hard_negatives=num_hard_negatives,
-                                                 num_positives=num_positives)
+        self.processor.embed_title = embed_title
+        self.processor.data_dir = Path(data_dir)
+        self.processor.train_filename = train_filename
+        self.processor.dev_filename = dev_filename
+        self.processor.test_filename = test_filename
+        self.processor.max_sample = max_sample
+        self.processor.dev_split = dev_split
+        self.processor.num_hard_negatives = num_hard_negatives
+        self.processor.num_positives = num_positives
 
         self.model.connect_heads_with_processor(self.processor.tasks, require_labels=True)
 
-        data_silo = DataSilo(processor=self.processor, batch_size=batch_size, distributed=False)
+        data_silo = DataSilo(processor=self.processor, batch_size=batch_size, distributed=False, max_processes=max_processes)
 
         # 5. Create an optimizer
         self.model, optimizer, lr_schedule = initialize_optimizer(
@@ -452,6 +471,14 @@ class EmbeddingRetriever(BaseRetriever):
                                      Default: -1 (very last layer).
         :param top_k: How many documents to return per query.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            document_store=document_store, embedding_model=embedding_model, model_version=model_version,
+            use_gpu=use_gpu, model_format=model_format, pooling_strategy=pooling_strategy,
+            emb_extraction_layer=emb_extraction_layer, top_k=top_k,
+        )
+
         self.document_store = document_store
         self.model_format = model_format
         self.pooling_strategy = pooling_strategy
@@ -518,7 +545,7 @@ class EmbeddingRetriever(BaseRetriever):
                                                            top_k=top_k, index=index)
         return documents
 
-    def embed(self, texts: Union[List[str], str]) -> List[np.ndarray]:
+    def embed(self, texts: Union[List[List[str]], List[str], str]) -> List[np.ndarray]:
         """
         Create embeddings for each text in a list of texts using the retrievers model (`self.embedding_model`)
 
@@ -537,9 +564,9 @@ class EmbeddingRetriever(BaseRetriever):
             emb = self.embedding_model.inference_from_dicts(dicts=[{"text": t} for t in texts])
             emb = [(r["vec"]) for r in emb]
         elif self.model_format == "sentence_transformers":
-            # text is single string, sentence-transformers needs a list of strings
+            # texts can be a list of strings or a list of [title, text]
             # get back list of numpy embedding vectors
-            emb = self.embedding_model.encode(texts)
+            emb = self.embedding_model.encode(texts, batch_size=200, show_progress_bar=False)
             emb = [r for r in emb]
         return emb
 
@@ -552,13 +579,15 @@ class EmbeddingRetriever(BaseRetriever):
         """
         return self.embed(texts)
 
-    def embed_passages(self, docs: List[Document]) -> List[np.ndarray]:
+    def embed_passages(self, docs: List[Document]) -> Union[List[str], List[List[str]]]:
         """
         Create embeddings for a list of passages. For this Retriever type: The same as calling .embed()
 
         :param docs: List of documents to embed
         :return: Embeddings, one per input passage
         """
-        texts = [d.text for d in docs]
-
-        return self.embed(texts)
+        if self.model_format == "sentence_transformers":
+            passages = [[d.meta["name"] if d.meta and "name" in d.meta else "", d.text] for d in docs]  # type: ignore
+        else:
+            passages = [d.text for d in docs] # type: ignore
+        return self.embed(passages)

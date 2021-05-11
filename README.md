@@ -59,10 +59,12 @@ Haystack is built in a modular fashion so that you can combine the best technolo
 | :mortar_board: [Tutorials](https://github.com/deepset-ai/haystack/#tutorials) | Jupyter/Colab Notebooks & Scripts |
 | :eyes: [How to use Haystack](https://github.com/deepset-ai/haystack/#how-to-use-haystack) | Basic explanation of concepts, options and usage |
 | :heart: [Contributing](https://github.com/deepset-ai/haystack/#heart-contributing) | We welcome all contributions! |
-| :bar_chart: [Benchmarks](https://haystack.deepset.ai/bm/benchmarks) | Speed & Accuracy of Retriever, Readers and DocumentStores |
-| :telescope: [Roadmap](https://haystack.deepset.ai/docs/latest/roadmapmd) | Public roadmap of Haystack |
 | :pray: [Slack](https://haystack.deepset.ai/community/join) | Join our community on Slack |
 | :bird: [Twitter](https://twitter.com/deepset_ai) | Follow us on Twitter for news and updates |
+| :vulcan_salute: [GitHub Discussions](https://github.com/deepset-ai/haystack/discussions) | We can always have a conversation here |
+| :hammer_and_pick: [Stack Overflow](https://stackoverflow.com/questions/tagged/haystack) | Questions about Haystack on Stack Overflow |
+| :bar_chart: [Benchmarks](https://haystack.deepset.ai/bm/benchmarks) | Speed & Accuracy of Retriever, Readers and DocumentStores |
+| :telescope: [Roadmap](https://haystack.deepset.ai/docs/latest/roadmapmd) | Public roadmap of Haystack |
 | :newspaper: [Blog](https://medium.com/deepset-ai) | Read our articles on Medium |
 
 ## Quick Demo
@@ -104,7 +106,7 @@ haystack-api_1   | [2021-01-01 10:21:58 +0000] [17] [INFO] Application startup c
 
 You should see the following:
 
-![image](https://github.com/deepset-ai/haystack/blob/master/docs/_src/img/streamlit_ui_screenshot.png)
+![image](https://raw.githubusercontent.com/deepset-ai/haystack/master/docs/_src/img/streamlit_ui_screenshot.png)
 
 You can then try different queries against a pre-defined set of indexed articles related to Game of Thrones.
 
@@ -271,6 +273,19 @@ If you'd like to learn more about Haystack, feel free to go through the tutorial
     [Colab](https://colab.research.google.com/github/deepset-ai/haystack/blob/master/tutorials/Tutorial9_DPR_training.ipynb)
     |
     [Python](https://github.com/deepset-ai/haystack/blob/master/tutorials/Tutorial9_DPR_training.py)
+-   Tutorial 10 - Knowledge Graph:
+    [Jupyter noteboook](https://github.com/deepset-ai/haystack/blob/master/tutorials/Tutorial10_Knowledge_Graph.ipynb)
+    |
+    [Colab](https://colab.research.google.com/github/deepset-ai/haystack/blob/master/tutorials/Tutorial10_Knowledge_Graph.ipynb)
+    |
+    [Python](https://github.com/deepset-ai/haystack/blob/master/tutorials/Tutorial10_Knowledge_Graph.py)
+-   Tutorial 11 - Pipelines:
+    [Jupyter noteboook](https://github.com/deepset-ai/haystack/blob/master/tutorials/Tutorial11_Pipelines.ipynb)
+    |
+    [Colab](https://colab.research.google.com/github/deepset-ai/haystack/blob/master/tutorials/Tutorial11_Pipelines.ipynb)
+    |
+    [Python](https://github.com/deepset-ai/haystack/blob/master/tutorials/Tutorial11_Pipelines.py)
+
 
 ## How to use Haystack
 

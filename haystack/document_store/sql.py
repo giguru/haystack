@@ -88,6 +88,12 @@ class SQLDocumentStore(BaseDocumentStore):
                                           added already exists. Using this parameter could cause performance degradation
                                           for document insertion.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            url=url, index=index, label_index=label_index, update_existing_documents=update_existing_documents
+        )
+
         engine = create_engine(url)
         ORMBase.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
@@ -124,27 +130,19 @@ class SQLDocumentStore(BaseDocumentStore):
 
         return documents
 
-    def get_documents_by_vector_ids(
-        self,
-        vector_ids: List[str],
-        index: Optional[str] = None,
-        batch_size: int = 10_000
-    ):
-        """
-        Fetch documents by specifying a list of text vector id strings
+    def get_documents_by_vector_ids(self, vector_ids: List[str], index: Optional[str] = None, batch_size: int = 10_000):
+        """Fetch documents by specifying a list of text vector id strings"""
+        index = index or self.index
 
-        :param vector_ids: List of vector_id strings.
-        :param index: Name of the index to get the documents from. If None, the
-                      DocumentStore's default index (self.index) will be used.
-        :param batch_size: When working with large number of documents, batching can help reduce memory footprint.
-        """
+        documents = []
+        for i in range(0, len(vector_ids), batch_size):
+            query = self.session.query(DocumentORM).filter(
+                DocumentORM.vector_id.in_(vector_ids[i: i + batch_size]),
+                DocumentORM.index == index
+            )
+            for row in query.all():
+                documents.append(self._convert_sql_row_to_document(row))
 
-        result = self._query(
-            index=index,
-            vector_ids=vector_ids,
-            batch_size=batch_size
-        )
-        documents = list(result)
         sorted_documents = sorted(documents, key=lambda doc: vector_ids.index(doc.meta["vector_id"]))
         return sorted_documents
 
@@ -448,19 +446,35 @@ class SQLDocumentStore(BaseDocumentStore):
         :param filters: Optional filters to narrow down the documents to be deleted.
         :return: None
         """
+        logger.warning(
+                """DEPRECATION WARNINGS: 
+                1. delete_all_documents() method is deprecated, please use delete_documents method
+                For more details, please refer to the issue: https://github.com/deepset-ai/haystack/issues/1045
+                """
+        )
+        self.delete_documents(index, filters)
 
+    def delete_documents(self, index: Optional[str] = None, filters: Optional[Dict[str, List[str]]] = None):
+        """
+        Delete documents in an index. All documents are deleted if no filters are passed.
+
+        :param index: Index name to delete the document from.
+        :param filters: Optional filters to narrow down the documents to be deleted.
+        :return: None
+        """
         index = index or self.index
         document_ids_to_delete = self.session.query(DocumentORM.id).filter_by(index=index)
         if filters:
             # documents_query = documents_query.join(MetaORM)
             for key, values in filters.items():
                 document_ids_to_delete = document_ids_to_delete.filter(
-                    MetaORM.name == key,
-                    MetaORM.value.in_(values),
-                    DocumentORM.id == MetaORM.document_id
+                        MetaORM.name == key,
+                        MetaORM.value.in_(values),
+                        DocumentORM.id == MetaORM.document_id
                 )
 
-        self.session.query(DocumentORM).filter(DocumentORM.id.in_(document_ids_to_delete)).delete(synchronize_session=False)
+        self.session.query(DocumentORM).filter(DocumentORM.id.in_(document_ids_to_delete)).delete(
+                synchronize_session=False)
         self.session.commit()
 
     def _get_or_create(self, session, model, **kwargs):
