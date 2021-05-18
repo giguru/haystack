@@ -53,7 +53,8 @@ class FARMReader(BaseReader):
         num_processes: Optional[int] = None,
         max_seq_len: int = 256,
         doc_stride: int = 128,
-        progress_bar: bool = True
+        progress_bar: bool = True,
+        duplicate_filtering: int = 0
     ):
 
         """
@@ -91,7 +92,18 @@ class FARMReader(BaseReader):
         :param doc_stride: Length of striding window for splitting long texts (used if ``len(text) > max_seq_len``)
         :param progress_bar: Whether to show a tqdm progress bar or not.
                              Can be helpful to disable in production deployments to keep the logs clean.
+        :param duplicate_filtering: Answers are filtered based on their position. Both start and end position of the answers are considered.
+                                    The higher the value, answers that are more apart are filtered out. 0 corresponds to exact duplicates. -1 turns off duplicate removal.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            model_name_or_path=model_name_or_path, model_version=model_version, context_window_size=context_window_size,
+            batch_size=batch_size, use_gpu=use_gpu, no_ans_boost=no_ans_boost, return_no_answer=return_no_answer,
+            top_k=top_k, top_k_per_candidate=top_k_per_candidate, top_k_per_sample=top_k_per_sample,
+            num_processes=num_processes, max_seq_len=max_seq_len, doc_stride=doc_stride, progress_bar=progress_bar,
+            duplicate_filtering=duplicate_filtering
+        )
 
         self.return_no_answers = return_no_answer
         self.top_k = top_k
@@ -99,7 +111,8 @@ class FARMReader(BaseReader):
         self.inferencer = QAInferencer.load(model_name_or_path, batch_size=batch_size, gpu=use_gpu,
                                             task_type="question_answering", max_seq_len=max_seq_len,
                                             doc_stride=doc_stride, num_processes=num_processes, revision=model_version,
-                                            disable_tqdm=not progress_bar)
+                                            disable_tqdm=not progress_bar,
+                                            strict=False)
         self.inferencer.model.prediction_heads[0].context_window_size = context_window_size
         self.inferencer.model.prediction_heads[0].no_ans_boost = no_ans_boost
         self.inferencer.model.prediction_heads[0].n_best = top_k_per_candidate + 1 # including possible no_answer
@@ -107,6 +120,10 @@ class FARMReader(BaseReader):
             self.inferencer.model.prediction_heads[0].n_best_per_sample = top_k_per_sample
         except:
             logger.warning("Could not set `top_k_per_sample` in FARM. Please update FARM version.")
+        try:
+            self.inferencer.model.prediction_heads[0].duplicate_filtering = duplicate_filtering
+        except:
+            logger.warning("Could not set `duplicate_filtering` in FARM. Please update FARM version.")
         self.max_seq_len = max_seq_len
         self.use_gpu = use_gpu
         self.progress_bar = progress_bar
@@ -309,7 +326,7 @@ class FARMReader(BaseReader):
         self.inferencer.batch_size = batch_size
         # make predictions on all document-query pairs
         predictions = self.inferencer.inference_from_objects(
-            objects=inputs, return_json=False, multiprocessing_chunksize=1
+            objects=inputs, return_json=False, multiprocessing_chunksize=10
         )
 
         # group predictions together
@@ -559,7 +576,7 @@ class FARMReader(BaseReader):
                         "answer": ans.answer,
                         "score": ans.score,
                         # just a pseudo prob for now
-                        "probability": self._get_pseudo_prob(ans.score),
+                        "probability": ans.confidence,
                         "context": ans.context_window,
                         "offset_start": ans.offset_answer_start - ans.offset_context_window_start,
                         "offset_end": ans.offset_answer_end - ans.offset_context_window_start,

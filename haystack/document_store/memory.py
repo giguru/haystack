@@ -44,6 +44,13 @@ class InMemoryDocumentStore(BaseDocumentStore):
         :param progress_bar: Whether to show a tqdm progress bar or not.
                              Can be helpful to disable in production deployments to keep the logs clean.
         """
+
+        # save init parameters to enable export of component config as YAML
+        self.set_config(
+            index=index, label_index=label_index, embedding_field=embedding_field, embedding_dim=embedding_dim,
+            return_embedding=return_embedding, similarity=similarity, progress_bar=progress_bar,
+        )
+
         self.indexes: Dict[str, Dict] = defaultdict(dict)
         self.index: str = index
         self.label_index: str = label_index
@@ -220,6 +227,14 @@ class InMemoryDocumentStore(BaseDocumentStore):
         documents = self.get_all_documents(index=index, filters=filters)
         return len(documents)
 
+    def get_embedding_count(self, filters: Optional[Dict[str, List[str]]] = None, index: Optional[str] = None) -> int:
+        """
+        Return the count of embeddings in the document store.
+        """
+        documents = self.get_all_documents(filters=filters, index=index)
+        embedding_count = sum(doc.embedding is not None for doc in documents)
+        return embedding_count
+
     def get_label_count(self, index: Optional[str] = None) -> int:
         """
         Return the number of labels in the document store
@@ -274,7 +289,7 @@ class InMemoryDocumentStore(BaseDocumentStore):
         result = self.get_all_documents_generator(index=index, filters=filters, return_embedding=return_embedding)
         documents = list(result)
         return documents
-      
+
     def get_all_documents_generator(
         self,
         index: Optional[str] = None,
@@ -330,7 +345,22 @@ class InMemoryDocumentStore(BaseDocumentStore):
         :param filters: Optional filters to narrow down the documents to be deleted.
         :return: None
         """
+        logger.warning(
+                """DEPRECATION WARNINGS: 
+                1. delete_all_documents() method is deprecated, please use delete_documents method
+                For more details, please refer to the issue: https://github.com/deepset-ai/haystack/issues/1045
+                """
+        )
+        self.delete_documents(index, filters)
 
+    def delete_documents(self, index: Optional[str] = None, filters: Optional[Dict[str, List[str]]] = None):
+        """
+        Delete documents in an index. All documents are deleted if no filters are passed.
+
+        :param index: Index name to delete the document from.
+        :param filters: Optional filters to narrow down the documents to be deleted.
+        :return: None
+        """
         if filters:
             raise NotImplementedError("Delete by filters is not implemented for InMemoryDocumentStore.")
         index = index or self.index

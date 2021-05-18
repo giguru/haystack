@@ -5,6 +5,7 @@ from elasticsearch import Elasticsearch
 from conftest import get_document_store
 from haystack import Document, Label
 from haystack.document_store.elasticsearch import ElasticsearchDocumentStore
+from haystack.document_store.faiss import FAISSDocumentStore
 
 
 @pytest.mark.elasticsearch
@@ -274,18 +275,33 @@ def test_update_embeddings(document_store, retriever):
     np.testing.assert_array_equal(embedding_before_update, embedding_after_update)
 
     # test updating with filters
-    document_store.update_embeddings(
-        retriever, index="haystack_test_1", batch_size=3, filters={"meta_field": ["value_0", "value_1"]}
-    )
-    doc_after_update = document_store.get_all_documents(index="haystack_test_1", filters={"meta_field": ["value_7"]})[0]
-    embedding_after_update = doc_after_update.embedding
-    np.testing.assert_array_equal(embedding_before_update, embedding_after_update)
+    if isinstance(document_store, FAISSDocumentStore):
+        with pytest.raises(Exception):
+            document_store.update_embeddings(
+                retriever, index="haystack_test_1", update_existing_embeddings=True, filters={"meta_field": ["value"]}
+            )
+    else:
+        document_store.update_embeddings(
+            retriever, index="haystack_test_1", batch_size=3, filters={"meta_field": ["value_0", "value_1"]}
+        )
+        doc_after_update = document_store.get_all_documents(index="haystack_test_1", filters={"meta_field": ["value_7"]})[0]
+        embedding_after_update = doc_after_update.embedding
+        np.testing.assert_array_equal(embedding_before_update, embedding_after_update)
 
     # test update all embeddings
     document_store.update_embeddings(retriever, index="haystack_test_1", batch_size=3, update_existing_embeddings=True)
+    assert document_store.get_embedding_count(index="haystack_test_1") == 11
     doc_after_update = document_store.get_all_documents(index="haystack_test_1", filters={"meta_field": ["value_7"]})[0]
     embedding_after_update = doc_after_update.embedding
     np.testing.assert_raises(AssertionError, np.testing.assert_array_equal, embedding_before_update, embedding_after_update)
+
+    # test update embeddings for newly added docs
+    documents = []
+    for i in range(12, 15):
+        documents.append({"text": f"text_{i}", "id": str(i), "meta_field": f"value_{i}"})
+    document_store.write_documents(documents, index="haystack_test_1")
+    document_store.update_embeddings(retriever, index="haystack_test_1", batch_size=3, update_existing_embeddings=False)
+    assert document_store.get_embedding_count(index="haystack_test_1") == 14
 
 
 @pytest.mark.elasticsearch
@@ -298,9 +314,18 @@ def test_delete_all_documents(document_store_with_docs):
 
 
 @pytest.mark.elasticsearch
+def test_delete_documents(document_store_with_docs):
+    assert len(document_store_with_docs.get_all_documents()) == 3
+
+    document_store_with_docs.delete_documents()
+    documents = document_store_with_docs.get_all_documents()
+    assert len(documents) == 0
+
+
+@pytest.mark.elasticsearch
 @pytest.mark.parametrize("document_store_with_docs", ["elasticsearch"], indirect=True)
 def test_delete_documents_with_filters(document_store_with_docs):
-    document_store_with_docs.delete_all_documents(filters={"meta_field": ["test1", "test2"]})
+    document_store_with_docs.delete_documents(filters={"meta_field": ["test1", "test2"]})
     documents = document_store_with_docs.get_all_documents()
     assert len(documents) == 1
     assert documents[0].meta["meta_field"] == "test3"
@@ -400,7 +425,7 @@ def test_multilabel(document_store):
     assert len(multi_labels) == 0
 
     # clean up
-    document_store.delete_all_documents(index="haystack_test_multilabel")
+    document_store.delete_documents(index="haystack_test_multilabel")
 
 
 @pytest.mark.elasticsearch
@@ -464,7 +489,7 @@ def test_multilabel_no_answer(document_store):
            == len(multi_labels[0].multiple_offset_start_in_docs)
 
     # clean up
-    document_store.delete_all_documents(index="haystack_test_multilabel_no_answer")
+    document_store.delete_documents(index="haystack_test_multilabel_no_answer")
 
 
 @pytest.mark.elasticsearch
