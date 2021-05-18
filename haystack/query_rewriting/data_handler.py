@@ -29,7 +29,8 @@ def qurectec_sample_to_features_text(sample: Sample,
                                      preprocessor,
                                      distant_supervision: bool,
                                      pad_on_left = False,
-                                     debugging = True
+                                     debugging = True,
+                                     include_current_turn_in_attention = False
                                      ) -> List[dict]:
     """
     Generates a dictionary of features for a given input sample that is to be consumed by a text classification model.
@@ -83,7 +84,8 @@ def qurectec_sample_to_features_text(sample: Sample,
     target_tokens, not_target_tokens = [], []  # for during debugging
 
     # The history starts after the initial [CLS] and ends at the second special token, which is [SEP]
-    end_for_attention_mask, end_of_input = special_tokens_positions[1], len(input_ids)
+    end_of_input = len(input_ids)
+    end_for_attention_mask = end_of_input if include_current_turn_in_attention else special_tokens_positions[1]
     bert_pos, running_spacy_idx = 0, 0
     try:
         while bert_pos < end_of_input:
@@ -105,8 +107,9 @@ def qurectec_sample_to_features_text(sample: Sample,
 
             if bert_pos < end_for_attention_mask:
 
-                is_not_punctuation_mark = running_word not in ['?', ',', '-', '.']
+                is_not_punctuation_mark = running_word not in ['?', ',', '-', '.', '(', ')', '_', "'", '"']
                 if is_not_punctuation_mark:
+                    # Cannot find this in paper, but also not put attention on stop word.
                     # Only put attention on start of words, since the paper says "The term classification
                     # layer is applied on top of the representation of the first sub-token of each term"
                     attention_mask[bert_pos] = 1
@@ -201,9 +204,11 @@ class CanardProcessor(Processor):
                  dev_split: int = None,
                  distant_supervision = False,
                  use_first_questions = False,
-                 verbose = True
+                 verbose = True,
+                 include_current_turn_in_attention = False,
                  ):
         self._distant_supervision = distant_supervision
+        self._include_current_turn_in_attention = include_current_turn_in_attention
         self._verbose = verbose
 
         # Always log this, so users have a log of the settings of their experiments
@@ -324,6 +329,7 @@ class CanardProcessor(Processor):
             max_seq_len=self.max_seq_len,
             tokenizer=self.tokenizer,
             preprocessor=self._preprocessor,
-            distant_supervision=self._distant_supervision
+            distant_supervision=self._distant_supervision,
+            include_current_turn_in_attention=self._include_current_turn_in_attention
         )
 

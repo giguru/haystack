@@ -56,9 +56,9 @@ class MicroMetrics:
         micro_precision = self.true_pos / (self.true_pos + self.false_pos)
         micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
         return {
-            'micro_recall': micro_recall,
-            'micro_precision': micro_precision,
-            'micro_f1': micro_f1
+            'micro_recall': micro_recall * 100,
+            'micro_precision': micro_precision * 100,
+            'micro_f1': micro_f1 * 100
         }
 
 
@@ -169,7 +169,7 @@ class QueryResolution(BaseComponent):
         # Set derived instance properties
         self.tokenizer = Tokenizer.load(model_name_or_path, **tokenizer_args)
         self.model = QueryResolutionModel(model_name_or_path=model_name_or_path, **model_args)
-        self._prev_eval_results = {'p': 0, 'r': 0, 'f1': 0}
+        self._prev_eval_results = {'p': [0], 'r': [0], 'f1': [0]}
 
         if use_gpu and torch.cuda.is_available():
             logger.info("Using GPU Cuda")
@@ -279,6 +279,11 @@ class QueryResolution(BaseComponent):
                     # Eval sets the model in eval mode, so set it to training mode again
                     self.model.train()
 
+                    n = 3
+                    if len(set(self._prev_eval_results['f1'][-n:])) == 1:
+                        # If the F1 score is the same n times in row, stop training, because there is no improvement.
+                        break
+
                 # TODO save every x points
                 # if checkpoint_every and step % checkpoint_every == 0:
 
@@ -306,11 +311,10 @@ class QueryResolution(BaseComponent):
             token_id_int = int(token_id)
             if attention_mask[idx] == 1.0:
                 relevant_token_ids['input'].append(token_id_int)
-
-                if target_tensor[idx] == 1.0:
-                    relevant_token_ids['target'].append(token_id_int)
-                if rounded_output[idx] == 1.0:
-                    relevant_token_ids['output'].append(token_id_int)
+            if target_tensor[idx] == 1.0:
+                relevant_token_ids['target'].append(token_id_int)
+            if rounded_output[idx] == 1.0:
+                relevant_token_ids['output'].append(token_id_int)
 
         if verbose:
             relevant_tokens = {k: self.tokenizer.convert_ids_to_tokens(ids=relevant_token_ids[k]) for k in relevant_token_ids}
@@ -340,14 +344,19 @@ class QueryResolution(BaseComponent):
             progress_bar = tqdm(data_loader, disable=disable_tqdm)
             for step, batch in enumerate(progress_bar):
                 for i in range(0, len(batch['input_ids'])):
-                    relevant_tokens = self._get_classifier_result(input_token_ids=batch['input_ids'][i],
-                                                                  attention_mask=batch['attention_mask'][i],
-                                                                  target_tensor=batch['target'][i],
-                                                                  output_tensor=batch['attention_mask'][i].type(torch.DoubleTensor),
-                                                                  verbose=False)
-                    metrics.add_to_values(predicted_tokens=relevant_tokens['input'],
-                                          gold_tokens=relevant_tokens['target'],
-                                          counts=False)
+                    predicted_tokens = []
+                    gold_tokens = []
+                    target_tensor = batch['target'][i].tolist()
+                    attention_tensor = batch['attention_mask'][i].tolist()
+
+                    for idx, token_id in enumerate(batch['input_ids'][i]):
+                        token_id_int = int(token_id)
+                        if attention_tensor[idx] == 1.0:
+                            predicted_tokens.append(token_id_int)
+                        if target_tensor[idx] == 1.0:
+                            gold_tokens.append(token_id_int)
+
+                    metrics.add_to_values(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens, counts=False)
 
                     input_lengths.append(list(batch['start_of_words'][i]).count(1))
                     number_of_positive_terms.append(list(batch['target'][i]).count(1))
@@ -358,6 +367,7 @@ class QueryResolution(BaseComponent):
                     f"Total terms:    {np.mean(input_lengths):.2f} +- {np.std(input_lengths):.2f}\n"
                     f"Positive terms: {np.mean(number_of_positive_terms):.2f} +- {np.std(number_of_positive_terms):.2f}")
         self._print_metrics(**metrics.calc_metric())
+        self._add_metrics(**metrics.calc_metric())
 
     def eval(self, data_loader, disable_tqdm: bool = False):
         self.model.to(self.device)
@@ -390,14 +400,17 @@ class QueryResolution(BaseComponent):
                     metrics.add_to_values(predicted_tokens=relevant_tokens['output'], gold_tokens=relevant_tokens['target'])
         print('\n')  # End the line printed by the progress_bar
         self._print_metrics(**metrics.calc_metric())
+        self._add_metrics(**metrics.calc_metric())
 
     def _print_metrics(self, micro_recall, micro_precision, micro_f1):
-        logger.info(f"\nMicro recall   : {micro_recall:.5f} ({(micro_recall - self._prev_eval_results['r']):.5f})\n"
-                    f"Micro precision: {micro_precision:.5f} ({(micro_precision - self._prev_eval_results['p']):.5f})\n"
-                    f"Micro F1       : {micro_f1:.5f} ({(micro_f1 - self._prev_eval_results['f1']):.5f})\n")
-        self._prev_eval_results['p'] = micro_precision
-        self._prev_eval_results['r'] = micro_recall
-        self._prev_eval_results['f1'] = micro_f1
+        logger.info(f"\nMicro recall   : {micro_recall:.5f} ({(micro_recall - self._prev_eval_results['r'][-1]):.5f})\n"
+                    f"Micro precision: {micro_precision:.5f} ({(micro_precision - self._prev_eval_results['p'][-1]):.5f})\n"
+                    f"Micro F1       : {micro_f1:.5f} ({(micro_f1 - self._prev_eval_results['f1'][-1]):.5f})\n")
+
+    def _add_metrics(self, micro_recall, micro_precision, micro_f1):
+        self._prev_eval_results['p'].append(micro_precision)
+        self._prev_eval_results['r'].append(micro_recall)
+        self._prev_eval_results['f1'].append(micro_f1)
 
     def rewrite(self, question: str, history):
         """

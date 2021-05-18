@@ -48,26 +48,26 @@ def data_set_statistics():
     query_resolution = QueryResolution(use_gpu=True)
     processor = CanardProcessor(tokenizer=query_resolution.tokenizer,
                                 max_seq_len=512,
-                                train_split=10,
+                                train_split=None,
                                 dev_split=None,
-                                test_split=10)
+                                test_split=None,
+                                use_first_questions=False,
+                                include_current_turn_in_attention=True)
+    query_resolution.dataset_statistics(processor, data_set="train")
     query_resolution.dataset_statistics(processor, data_set="dev")
+    query_resolution.dataset_statistics(processor, data_set="test")
 
 
 def evaluate():
-    query_resolution = QueryResolution(model_name_or_path="./saved_models/query_resolution_learning_rate_3e-05_eps_1e-08_weight_decay_0_01_dropout_0_1",
-                                       # tokenizer_args={
-                                       #     'tokenizer_class': 'BertTokenizer'
-                                       # }
-                                       )
+    query_resolution = QueryResolution(model_name_or_path="./saved_models/query_resolution_learning_rate_3e-05_eps_1e-08_weight_decay_0_01_dropout_0_1")
     processor = CanardProcessor(tokenizer=query_resolution.tokenizer,
                                 max_seq_len=512,
                                 train_split=10,
-                                dev_split=10,
+                                dev_split=None,
                                 test_split=None)
     data_silo = DataSilo(processor=processor, batch_size=100, distributed=False, max_processes=1)
-    query_resolution.eval(data_silo.get_data_loader('dev'))
+    query_resolution.eval(data_silo.get_data_loader('test'))
 
 
-evaluate()
+data_set_statistics()
 exit()
