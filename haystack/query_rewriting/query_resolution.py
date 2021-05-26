@@ -237,7 +237,7 @@ class QueryResolution(BaseComponent):
                 # not interested in predicting a label for those", so only compute loss for tokens you need to predict
                 # a label for
                 loss_tensors = loss_fn(outputs, target)
-                loss = torch.mean(loss_tensors * batch['attention_mask'])
+                loss = torch.mean(loss_tensors * batch['start_of_words'])
                 total_loss += loss
                 loss.backward()
 
