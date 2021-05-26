@@ -59,8 +59,8 @@ def train():
                            datasilo_args={
                                "caching": False
                            },
-                           learning_rate=3e-7,
-                           num_warmup_steps=0,
+                           learning_rate=1e-6,
+                           num_warmup_steps=100,
                            early_stopping=1200)
 
     logger.info("Evaluating test dataset...")
