@@ -93,5 +93,5 @@ def evaluate():
     data_silo = DataSilo(processor=processor, batch_size=100, distributed=False, max_processes=1)
     query_resolution.eval(data_silo.get_data_loader('test'), metrics=EvalQueryResolution(use_counts=True))
 
-train()
+data_set_statistics()
 exit()

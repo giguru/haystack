@@ -73,8 +73,7 @@ def qurectec_sample_to_features_text(sample: Sample,
     gold_terms = sample.clear_text[CanardProcessor.gold_terms]
     special_tokens_positions = np.where(np.array(inputs['special_tokens_mask']) == 1)[0]
 
-    # Put attention on everything that is not padding.
-    attention_mask = [1] * len(input_ids)
+    attention_mask = [0] * len(input_ids)
 
     # Because of the structure of haystack, you don't have access to the sample data in the training loop. However,
     # the target vector required for computing the loss for QuReTec is not in QuAC. So create the target vector
@@ -87,7 +86,7 @@ def qurectec_sample_to_features_text(sample: Sample,
 
     # The history starts after the initial [CLS] and ends at the second special token, which is [SEP]
     end_of_input = len(input_ids)
-    end_for_attention_of_target = end_of_input if include_current_turn_in_target else special_tokens_positions[1]
+    end_for_target = end_of_input if include_current_turn_in_target else special_tokens_positions[1]
 
     bert_pos, running_spacy_idx = 0, 0
     try:
@@ -103,12 +102,14 @@ def qurectec_sample_to_features_text(sample: Sample,
                                                                  skip_positions=special_tokens_positions,
                                                                  parse=False)
             start_of_word[bert_pos] = 1
-            if bert_pos < end_for_attention_of_target:
+            if bert_pos < end_for_target:
                 is_punctuation_mark = running_word in ['?', ',', '-', '.', '(', ')', '_', "'", '"']
 
                 # Only target the start of words, since the paper says "The term classification
                 # layer is applied on top of the representation of the first sub-token of each term"
                 if not is_punctuation_mark: # and running_word not in nlp.Defaults.stop_words:
+                    attention_mask[bert_pos] = 1
+
                     if running_word in gold_terms:
                         target[bert_pos] = 1
                         if debugging:
@@ -119,7 +120,7 @@ def qurectec_sample_to_features_text(sample: Sample,
             bert_pos += 1 + extra
     except IndexError as e:
         print(e)
-    del bert_pos, running_spacy_idx, end_for_attention_of_target, end_of_input
+    del bert_pos, running_spacy_idx, end_for_target, end_of_input
 
     # Padding up to the sequence length.
     pad_on_left = False

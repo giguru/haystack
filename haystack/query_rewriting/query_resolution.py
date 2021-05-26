@@ -256,7 +256,6 @@ class QueryResolution(BaseComponent):
                         input_ids=input_id_tensor.tolist(),
                         predicted_tensor=output_tensor.round().tolist(),
                         target_tensor=target_tensor.tolist(),
-                        attention_tensor=attention_tensor,
                     )
                     logger.info(f"The items used for metrics are: \n"
                                 f"Predicted words: {predicted_tokens}\n"
@@ -337,7 +336,7 @@ class QueryResolution(BaseComponent):
                              distributed=False,
                              max_processes=1,
                              caching=False,
-                             automatic_loading=False)
+                             automatic_loading=True)
 
         for data_set in data_sets:
             data_loader = data_silo.get_data_loader(data_set)
@@ -358,8 +357,8 @@ class QueryResolution(BaseComponent):
 
                         predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=input_ids_tensor.tolist(),
                                                                                             predicted_tensor=predicted_tensor.tolist(),
-                                                                                            target_tensor=target_tensor.tolist(),
-                                                                                            attention_tensor=attention_tensor.tolist())
+                                                                                            target_tensor=target_tensor.tolist()
+                                                                                            )
                         metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
 
                         input_lengths.append(list(batch['start_of_words'][i]).count(1))
@@ -383,11 +382,11 @@ class QueryResolution(BaseComponent):
             metrics.print(mode="query_resolution", use_logged_values=False)
             metrics.init_counts()
 
-    def _get_predicted_and_gold_tokens(self, input_ids, predicted_tensor, target_tensor, attention_tensor):
+    def _get_predicted_and_gold_tokens(self, input_ids, predicted_tensor, target_tensor):
         predicted_terms = []
         gold_terms = []
         for idx, token_id in enumerate(input_ids):
-            if attention_tensor[idx] == 1 and (predicted_tensor[idx] == 1.0 or target_tensor[idx] == 1.0):
+            if predicted_tensor[idx] == 1.0 or target_tensor[idx] == 1.0:
                 # Paper says: "We apply lowercase, lemmatization and stopword removal to qi∗,
                 # q1:i−1 and qi using Spacy12 before calculating term overlap in Equation 2.", so
                 # lemmatise the full word and remove non-stopwords
@@ -433,7 +432,6 @@ class QueryResolution(BaseComponent):
                     predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=batch['input_ids'][i].tolist(),
                                                                                         predicted_tensor=sigmoid_outputs[i].float().round().tolist(),
                                                                                         target_tensor=batch['target'][i].tolist(),
-                                                                                        attention_tensor=batch['attention_mask'][i].tolist()
                                                                                         )
                     metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
         progress_bar.close()
