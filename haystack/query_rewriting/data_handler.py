@@ -65,7 +65,7 @@ def qurectec_sample_to_features_text(sample: Sample,
     :param sample: Sample object that contains human readable text and label fields from a single text classification data sample
     :param max_seq_len: Sequences are truncated after this many tokens
     :param tokenizer: A tokenizer object that can turn string sentences into a list of tokens
-    :return: A list with one dictionary containing the keys "input_ids", "padding_mask" and "segment_ids" (also "label_ids" if not
+    :return: A list with one dictionary containing the keys "input_ids" and "segment_ids" (also "label_ids" if not
              in inference mode). The values are lists containing those features.
     """
     inputs = sample.tokenized
@@ -73,12 +73,8 @@ def qurectec_sample_to_features_text(sample: Sample,
     gold_terms = sample.clear_text[CanardProcessor.gold_terms]
     special_tokens_positions = np.where(np.array(inputs['special_tokens_mask']) == 1)[0]
 
-    # The mask has 1 for real tokens and 0 for padding tokens. Only real tokens are attended to.
-    padding_mask = [1] * len(input_ids)
-
-    # This method was made for QuReTec by Voskarides and they explicitly mention "We mask out the output of <CLS> and
-    # the current turn terms, since we are not interested in predicting a label for those", so mask the history only
-    attention_mask = [0] * len(input_ids)
+    # Put attention on everything that is not padding.
+    attention_mask = [1] * len(input_ids)
 
     # Because of the structure of haystack, you don't have access to the sample data in the training loop. However,
     # the target vector required for computing the loss for QuReTec is not in QuAC. So create the target vector
@@ -92,6 +88,7 @@ def qurectec_sample_to_features_text(sample: Sample,
     # The history starts after the initial [CLS] and ends at the second special token, which is [SEP]
     end_of_input = len(input_ids)
     end_for_attention_mask = end_of_input if include_current_turn_in_attention else special_tokens_positions[1]
+
     bert_pos, running_spacy_idx = 0, 0
     try:
         while bert_pos < end_of_input:
@@ -105,17 +102,13 @@ def qurectec_sample_to_features_text(sample: Sample,
                                                                  pos=bert_pos,
                                                                  skip_positions=special_tokens_positions,
                                                                  parse=False)
-
             start_of_word[bert_pos] = 1
-
             if bert_pos < end_for_attention_mask:
                 is_punctuation_mark = running_word in ['?', ',', '-', '.', '(', ')', '_', "'", '"']
 
-                # Only put attention on start of words, since the paper says "The term classification
+                # Only target the start of words, since the paper says "The term classification
                 # layer is applied on top of the representation of the first sub-token of each term"
                 if not is_punctuation_mark: # and running_word not in nlp.Defaults.stop_words:
-                    attention_mask[bert_pos] = 1
-
                     if running_word in gold_terms:
                         target[bert_pos] = 1
                         if debugging:
@@ -132,13 +125,11 @@ def qurectec_sample_to_features_text(sample: Sample,
     pad_on_left = False
     token_type_ids = pad(token_type_ids, max_seq_len, 0, pad_on_left=pad_on_left)
     input_ids = pad(input_ids, max_seq_len, tokenizer.pad_token_id, pad_on_left=pad_on_left)
-    padding_mask = pad(padding_mask, max_seq_len, 0, pad_on_left=pad_on_left)
     attention_mask = pad(attention_mask, max_seq_len, 0, pad_on_left=pad_on_left)
     target = pad(target, max_seq_len, 0, pad_on_left=pad_on_left)
     start_of_word = pad(start_of_word, max_seq_len, 0, pad_on_left=pad_on_left)
 
     assert len(input_ids) == max_seq_len, f"The input_ids vector has length {len(input_ids)}"
-    assert len(padding_mask) == max_seq_len, f"The padding_mask vector has length {len(padding_mask)}"
     assert len(token_type_ids) == max_seq_len, f"The token_type_ids vector has length {len(token_type_ids)}"
     assert len(attention_mask) == max_seq_len, f"The attention vector has length {len(attention_mask)}"
     assert len(start_of_word) == max_seq_len, f"The start_of_word vector has length {len(start_of_word)}"
@@ -147,7 +138,6 @@ def qurectec_sample_to_features_text(sample: Sample,
     # Return a list with a features dict
     return [{
         "input_ids": input_ids,
-        "padding_mask": padding_mask,
         "attention_mask": attention_mask,
         "start_of_words": start_of_word,
         "token_type_ids": token_type_ids,

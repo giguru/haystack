@@ -232,6 +232,9 @@ class QueryResolution(BaseComponent):
                                      attention_mask=batch['attention_mask'],
                                      token_type_ids=batch['token_type_ids'])
                 target = batch['target'].float()
+
+                # Voskarides and they explicitly mention "We mask out the output
+                # of <CLS> and the current turn terms, since we are not interested in predicting a label for those", so only compute loss for
                 loss = loss_fn(outputs, target)
                 total_loss += loss
                 loss.backward()
@@ -329,7 +332,7 @@ class QueryResolution(BaseComponent):
                              batch_size=batch_size,
                              distributed=False,
                              max_processes=1,
-                             caching=True,
+                             caching=False,
                              automatic_loading=False)
 
         for data_set in data_sets:

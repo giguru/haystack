@@ -37,7 +37,7 @@ def find_hyperparameters():
                                        eval_data_set="dev",
                                        learning_rate=lr,
                                        datasilo_args={
-                                           "caching": True
+                                           "caching": False
                                        })
             except ZeroDivisionError as e:
                 logger.info(e)
@@ -57,7 +57,7 @@ def train():
                            evaluate_every=100,
                            eval_data_set="dev",
                            datasilo_args={
-                               "caching": True
+                               "caching": False
                            },
                            learning_rate=1e-6,
                            num_warmup_steps=0,
