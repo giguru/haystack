@@ -206,7 +206,7 @@ class QueryResolution(BaseComponent):
         # Set in training mode
         self.model.train()
 
-        loss_fn = nn.BCEWithLogitsLoss()
+        loss_fn = nn.BCEWithLogitsLoss(reduction="none")
         loss = 0
         total_loss = 0
 
@@ -233,9 +233,10 @@ class QueryResolution(BaseComponent):
                                      token_type_ids=batch['token_type_ids'])
                 target = batch['target'].float()
 
-                # Voskarides and they explicitly mention "We mask out the output
-                # of <CLS> and the current turn terms, since we are not interested in predicting a label for those", so only compute loss for
-                loss = loss_fn(outputs, target)
+                # Voskarides et al. mention "We mask out the output of <CLS> and the current turn terms, since we are
+                # not interested in predicting a label for those", so only compute loss for history
+                loss_tensors = loss_fn(outputs, target)
+                loss = torch.mean(loss_tensors * batch['attention_mask'])
                 total_loss += loss
                 loss.backward()
 

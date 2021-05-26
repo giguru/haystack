@@ -57,7 +57,7 @@ def qurectec_sample_to_features_text(sample: Sample,
                                      max_seq_len: int,
                                      tokenizer: BertTokenizer,
                                      debugging = True,
-                                     include_current_turn_in_attention = False
+                                     include_current_turn_in_target = False
                                      ) -> List[dict]:
     """
     Generates a dictionary of features for a given input sample that is to be consumed by a text classification model.
@@ -87,7 +87,7 @@ def qurectec_sample_to_features_text(sample: Sample,
 
     # The history starts after the initial [CLS] and ends at the second special token, which is [SEP]
     end_of_input = len(input_ids)
-    end_for_attention_mask = end_of_input if include_current_turn_in_attention else special_tokens_positions[1]
+    end_for_attention_of_target = end_of_input if include_current_turn_in_target else special_tokens_positions[1]
 
     bert_pos, running_spacy_idx = 0, 0
     try:
@@ -103,7 +103,7 @@ def qurectec_sample_to_features_text(sample: Sample,
                                                                  skip_positions=special_tokens_positions,
                                                                  parse=False)
             start_of_word[bert_pos] = 1
-            if bert_pos < end_for_attention_mask:
+            if bert_pos < end_for_attention_of_target:
                 is_punctuation_mark = running_word in ['?', ',', '-', '.', '(', ')', '_', "'", '"']
 
                 # Only target the start of words, since the paper says "The term classification
@@ -119,7 +119,7 @@ def qurectec_sample_to_features_text(sample: Sample,
             bert_pos += 1 + extra
     except IndexError as e:
         print(e)
-    del bert_pos, running_spacy_idx, end_for_attention_mask, end_of_input
+    del bert_pos, running_spacy_idx, end_for_attention_of_target, end_of_input
 
     # Padding up to the sequence length.
     pad_on_left = False
@@ -199,18 +199,18 @@ class CanardProcessor(Processor):
                  test_split: int = None,
                  dev_split: int = None,
                  verbose: bool = True,
-                 include_current_turn_in_attention: bool = False,
+                 include_current_turn_in_target: bool = False,
                  data_dir=base + '/canard/voskarides_preprocessed',
                  train_filename: str = 'train_gold_supervision.json',
                  test_filename: str = 'test_gold_supervision.json',
                  dev_filename: str = 'dev_gold_supervision.json',
                  ):
-        self._include_current_turn_in_attention = include_current_turn_in_attention
+        self._include_current_turn_in_target = include_current_turn_in_target
         self._verbose = verbose
 
         # Always log this, so users have a log of the settings of their experiments
         logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}, "
-                    f"include_current_turn_in_attention={include_current_turn_in_attention}")
+                    f"include_current_turn_in_target={include_current_turn_in_target}")
 
         train_filename = data_dir + '/' + train_filename
         test_filename = data_dir + '/' + test_filename
@@ -309,6 +309,6 @@ class CanardProcessor(Processor):
             sample=sample,
             max_seq_len=self.max_seq_len,
             tokenizer=self.tokenizer,
-            include_current_turn_in_attention=self._include_current_turn_in_attention
+            include_current_turn_in_target=self._include_current_turn_in_target
         )
 

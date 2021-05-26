@@ -28,7 +28,7 @@ def find_hyperparameters():
                                             train_split=None,
                                             dev_split=None,
                                             test_split=None,
-                                            include_current_turn_in_attention=False)
+                                            include_current_turn_in_target=False)
                 query_resolution.train(processor,
                                        eval_metrics=EvalQueryResolution(use_counts=True),
                                        n_gpu=1,
@@ -50,7 +50,7 @@ def train():
                                 train_split=None,
                                 test_split=None,
                                 dev_split=None,
-                                include_current_turn_in_attention=False)
+                                include_current_turn_in_target=False)
     query_resolution.train(processor,
                            eval_metrics=EvalQueryResolution(use_counts=True),
                            print_every=100,
@@ -59,7 +59,7 @@ def train():
                            datasilo_args={
                                "caching": False
                            },
-                           learning_rate=1e-6,
+                           learning_rate=3e-7,
                            num_warmup_steps=0,
                            early_stopping=1200)
 
@@ -75,7 +75,7 @@ def data_set_statistics():
                                 train_split=None,
                                 dev_split=None,
                                 test_split=None,
-                                include_current_turn_in_attention=True,
+                                include_current_turn_in_target=True,
                                 )
     query_resolution.dataset_statistics(processor,
                                         data_sets=["test"],
