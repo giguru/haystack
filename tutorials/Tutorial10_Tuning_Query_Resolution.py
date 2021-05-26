@@ -44,7 +44,7 @@ def find_hyperparameters():
 
 
 def train():
-    query_resolution = QueryResolution(model_args={'dropout_prob': 0.2}, use_gpu=True)
+    query_resolution = QueryResolution(model_args={'dropout_prob': 0.1}, use_gpu=True)
     processor = CanardProcessor(tokenizer=query_resolution.tokenizer,
                                 max_seq_len=512,
                                 train_split=None,

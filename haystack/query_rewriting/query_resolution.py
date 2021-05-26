@@ -234,7 +234,8 @@ class QueryResolution(BaseComponent):
                 target = batch['target'].float()
 
                 # Voskarides et al. mention "We mask out the output of <CLS> and the current turn terms, since we are
-                # not interested in predicting a label for those", so only compute loss for history
+                # not interested in predicting a label for those", so only compute loss for tokens you need to predict
+                # a label for
                 loss_tensors = loss_fn(outputs, target)
                 loss = torch.mean(loss_tensors * batch['attention_mask'])
                 total_loss += loss
@@ -245,15 +246,17 @@ class QueryResolution(BaseComponent):
                     output_tensor = self.sigmoid(outputs.detach()).detach()[0].float()
                     input_id_tensor = batch['input_ids'][0]
                     target_tensor = target[0]
+                    attention_tensor = batch['attention_mask'][0].tolist()
                     self._print_classifier_result(input_token_ids=input_id_tensor,
-                                                  attention_mask=batch['attention_mask'][0],
+                                                  attention_mask=attention_tensor,
                                                   target_tensor=target_tensor,
                                                   output_tensor=output_tensor,
                                                   verbose=True)
                     predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(
                         input_ids=input_id_tensor.tolist(),
                         predicted_tensor=output_tensor.round().tolist(),
-                        target_tensor=target_tensor.tolist()
+                        target_tensor=target_tensor.tolist(),
+                        attention_tensor=attention_tensor,
                     )
                     logger.info(f"The items used for metrics are: \n"
                                 f"Predicted words: {predicted_tokens}\n"
@@ -355,7 +358,8 @@ class QueryResolution(BaseComponent):
 
                         predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=input_ids_tensor.tolist(),
                                                                                             predicted_tensor=predicted_tensor.tolist(),
-                                                                                            target_tensor=target_tensor.tolist())
+                                                                                            target_tensor=target_tensor.tolist(),
+                                                                                            attention_tensor=attention_tensor.tolist())
                         metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
 
                         input_lengths.append(list(batch['start_of_words'][i]).count(1))
@@ -379,11 +383,11 @@ class QueryResolution(BaseComponent):
             metrics.print(mode="query_resolution", use_logged_values=False)
             metrics.init_counts()
 
-    def _get_predicted_and_gold_tokens(self, input_ids, predicted_tensor, target_tensor):
+    def _get_predicted_and_gold_tokens(self, input_ids, predicted_tensor, target_tensor, attention_tensor):
         predicted_terms = []
         gold_terms = []
         for idx, token_id in enumerate(input_ids):
-            if predicted_tensor[idx] == 1.0 or target_tensor[idx] == 1.0:
+            if attention_tensor[idx] == 1 and (predicted_tensor[idx] == 1.0 or target_tensor[idx] == 1.0):
                 # Paper says: "We apply lowercase, lemmatization and stopword removal to qi∗,
                 # q1:i−1 and qi using Spacy12 before calculating term overlap in Equation 2.", so
                 # lemmatise the full word and remove non-stopwords
@@ -428,7 +432,8 @@ class QueryResolution(BaseComponent):
                 for i in range(0, len(batch['input_ids'])):
                     predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=batch['input_ids'][i].tolist(),
                                                                                         predicted_tensor=sigmoid_outputs[i].float().round().tolist(),
-                                                                                        target_tensor=batch['target'][i].tolist()
+                                                                                        target_tensor=batch['target'][i].tolist(),
+                                                                                        attention_tensor=batch['attention_mask'][i].tolist()
                                                                                         )
                     metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
         progress_bar.close()
