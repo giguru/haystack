@@ -1,66 +1,25 @@
 import json
 import re
-from collections import defaultdict
 from pathlib import Path
 from typing import List
-
 import torch
 import logging
 import numpy as np
 from farm.data_handler.utils import is_json
-
 from tqdm import tqdm
 import time
 from torch import nn
 import datetime
-
 from farm.modeling.tokenization import Tokenizer
 from transformers import AutoModel
 from farm.modeling.optimization import initialize_optimizer
 from farm.data_handler.data_silo import DataSilo
-
 from haystack import BaseComponent
+from haystack.eval import EvalQueryResolution
+from haystack.query_rewriting.data_handler import get_full_word
+import spacy
 
 logger = logging.getLogger(__name__)
-
-
-class MicroMetrics:
-    def __init__(self):
-        self.true_pos, self.false_pos, self.false_neg = (0., 0., 0.)
-
-    def add_to_values(self, predicted_tokens: List[int], gold_tokens: List[int], counts: bool = False):
-        predicted_count = {i: predicted_tokens.count(i) if counts else 1 for i in predicted_tokens}
-        gold_count = {i: gold_tokens.count(i) if counts else 1 for i in gold_tokens}
-        fp, tp, fn = 0, 0, 0
-
-        for i in predicted_count:
-            if i not in gold_count:
-                fp += predicted_count[i]
-            elif predicted_count[i] >= gold_count[i]:
-                tp += gold_count[i]
-                fp += predicted_count[i] - gold_count[i]
-            elif predicted_count[i] < gold_count[i]:
-                tp += predicted_count[i]
-                fn += gold_count[i] - predicted_count[i]
-        # Some id might have never been predicted
-        for i in gold_count:
-            if i not in predicted_count:
-                fn += gold_count[i]
-
-        self.true_pos += tp
-        self.false_pos += fp
-        self.false_neg += fn
-
-    def calc_metric(self):
-        micro_recall = self.true_pos / (self.true_pos + self.false_neg)
-        micro_precision = self.true_pos / (self.true_pos + self.false_pos)
-        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
-        return {
-            'micro_recall': micro_recall * 100,
-            'micro_precision': micro_precision * 100,
-            'micro_f1': micro_f1 * 100
-        }
-
 
 def dict_to_string(d: dict):
     regex = '#(\W|\.)+#'
@@ -77,7 +36,7 @@ class QueryResolutionModel(nn.Module):
                  model_name_or_path: str,
                  linear_layer_size=1024,
                  output_size=512,
-                 dropout_prob=0.0
+                 dropout_prob=0.0,
                  ):
         """
         :param linear_layer_size
@@ -119,9 +78,8 @@ class QueryResolutionModel(nn.Module):
         :type save_dir: str
         """
         Path(save_dir).mkdir(exist_ok=True, parents=True)
-
         logger.info("Saving model to folder: "+str(save_dir))
-        torch.save(self.state_dict(), f=Path(save_dir) / 'pytorch_model.bin', )
+        torch.save(self.state_dict(), f=Path(save_dir) / 'pytorch_model.bin')
         self._save_config(save_dir)
 
     def _save_config(self, save_dir: str):
@@ -154,7 +112,8 @@ class QueryResolution(BaseComponent):
                  use_gpu: bool = True,
                  progress_bar: bool = True,
                  tokenizer_args: dict = {},
-                 model_args: dict = {}
+                 model_args: dict = {},
+                 space_lang="en_core_web_sm"
         ):
         """
         Query resolution for Session based pipeline runs. This component is based on the paper:
@@ -169,7 +128,6 @@ class QueryResolution(BaseComponent):
         # Set derived instance properties
         self.tokenizer = Tokenizer.load(model_name_or_path, **tokenizer_args)
         self.model = QueryResolutionModel(model_name_or_path=model_name_or_path, **model_args)
-        self._prev_eval_results = {'p': [0], 'r': [0], 'f1': [0]}
 
         if use_gpu and torch.cuda.is_available():
             logger.info("Using GPU Cuda")
@@ -178,10 +136,13 @@ class QueryResolution(BaseComponent):
             logger.info("Using CPU")
             self.device = torch.device("cpu")
 
+        self.nlp = spacy.load(space_lang)
+
     def train(self,
               processor,
+              eval_metrics: EvalQueryResolution,
               eval_data_set: str,
-              learning_rate: float = 3e-5,
+              learning_rate: float = 3e-6,
               batch_size: int = 2,
               gradient_clipping: float = 1.0,
               n_gpu: int = 1,
@@ -189,19 +150,31 @@ class QueryResolution(BaseComponent):
               evaluate_every: int = 200,
               print_every: int = 200,
               epsilon: float = 1e-08,  # TODO QuReTec does not mention epsilon
-              n_epochs: int = 1,  # TODO QuReTec paper does not mention epochs.
+              n_epochs: int = 1,
               save_dir: str = "saved_models",
               disable_tqdm: bool = False,
               grad_acc_steps: int = 2,
-              weight_decay: float = 0.01
+              weight_decay: float = 0.01,
+              datasilo_args: dict = None,
+              num_warmup_steps: int = 200,
+              early_stopping: int = None,
+              checkpoint_every: int = None,
               ):
         logger.info(f'Training QueryResolution with batch_size={batch_size}, gradient_clipping={gradient_clipping}, '
-                    f'epsilon={epsilon}, n_gpu={n_gpu}, grad_acc_steps={grad_acc_steps}')
+                    f'epsilon={epsilon}, n_gpu={n_gpu}, grad_acc_steps={grad_acc_steps}, evaluate_every={evaluate_every}, '
+                    f'print_every={print_every}, early_stopping={early_stopping}')
+        if datasilo_args is None:
+            datasilo_args = {
+                "caching": False,
+            }
+
+        if checkpoint_every is None and evaluate_every:
+            checkpoint_every = evaluate_every
 
         self.data_silo = DataSilo(processor=processor,
                                   batch_size=batch_size,
-                                  distributed=False,
-                                  max_processes=1
+                                  max_processes=1,
+                                  **datasilo_args
                                   )
 
         # Create an optimizer
@@ -214,13 +187,21 @@ class QueryResolution(BaseComponent):
                             "eps": epsilon
                             },
             schedule_opts={"name": "LinearWarmup",
-                           "num_warmup_steps": 0
+                           "num_warmup_steps": num_warmup_steps,
                            },
             n_batches=len(self.data_silo.loaders["train"]),
             grad_acc_steps=grad_acc_steps,
             n_epochs=n_epochs,
             device=self.device,
         )
+
+        params_dict = {
+            'learning_rate': learning_rate,
+            'eps': epsilon,
+            'weight_decay': weight_decay,
+            'dropout': self.model.dropout_prob
+        }
+        model_save_dir = Path(save_dir) / ("query_resolution_" + dict_to_string(params_dict))
 
         # Set in training mode
         self.model.train()
@@ -257,11 +238,22 @@ class QueryResolution(BaseComponent):
 
                 if print_every and step % print_every == 0:
                     # Show an example of the results
-                    sigmoid_outputs = self.sigmoid(outputs.detach()).detach()
-                    self._get_classifier_result(input_token_ids=batch['input_ids'][0],
-                                                attention_mask=batch['attention_mask'][0],
-                                                target_tensor=target[0],
-                                                output_tensor=sigmoid_outputs[0])
+                    output_tensor = self.sigmoid(outputs.detach()).detach()[0].float()
+                    input_id_tensor = batch['input_ids'][0]
+                    target_tensor = target[0]
+                    self._print_classifier_result(input_token_ids=input_id_tensor,
+                                                  attention_mask=batch['attention_mask'][0],
+                                                  target_tensor=target_tensor,
+                                                  output_tensor=output_tensor,
+                                                  verbose=True)
+                    predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(
+                        input_ids=input_id_tensor.tolist(),
+                        predicted_tensor=output_tensor.round().tolist(),
+                        target_tensor=target_tensor.tolist()
+                    )
+                    logger.info(f"The items used for metrics are: \n"
+                                f"Predicted words: {predicted_tokens}\n"
+                                f"Gold tokens: {gold_tokens}")
                 # Prevent exploding gradients
                 if hasattr(optimizer, "clip_grad_norm"):
                     # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
@@ -274,39 +266,37 @@ class QueryResolution(BaseComponent):
                 lr_schedule.step()  # Update the learning rate
 
                 if evaluate_every and step % evaluate_every == 0:
-                    self.eval(data_loader=self.data_silo.get_data_loader(eval_data_set))
+                    logger.info(f"Evaluating at step {step}")
+                    self.eval(data_loader=self.data_silo.get_data_loader(eval_data_set), metrics=eval_metrics)
 
                     # Eval sets the model in eval mode, so set it to training mode again
                     self.model.train()
 
-                    n = 3
-                    if len(set(self._prev_eval_results['f1'][-n:])) == 1:
-                        # If the F1 score is the same n times in row, stop training, because there is no improvement.
+                    if eval_metrics.has_no_improvement():
                         break
 
-                # TODO save every x points
-                # if checkpoint_every and step % checkpoint_every == 0:
+                if early_stopping and step >= early_stopping:
+                    break
 
-        params_dict = {
-            'learning_rate': learning_rate,
-            'eps':  epsilon,
-            'weight_decay': weight_decay,
-            'dropout': self.model.dropout_prob
-        }
-        model_save_dir = Path(save_dir) / ("query_resolution_" + dict_to_string(params_dict))
+                if checkpoint_every and step % checkpoint_every == 0:
+                    checkpoint_model_save_dir = str(model_save_dir) + ".ckpt-" + str(step)
+                    self.model.save(checkpoint_model_save_dir)
+                    self.tokenizer.save_pretrained(save_directory=checkpoint_model_save_dir)
+
         self.model.save(model_save_dir)
         self.tokenizer.save_pretrained(save_directory=str(model_save_dir))
 
-    def _get_classifier_result(self,
-                               input_token_ids: torch.Tensor,
-                               target_tensor: torch.Tensor,
-                               output_tensor: torch.Tensor,
-                               attention_mask: torch.Tensor,
-                               verbose: bool = True):
+    def _print_classifier_result(self,
+                                 input_token_ids: torch.Tensor,
+                                 target_tensor: torch.Tensor,
+                                 output_tensor: torch.Tensor,
+                                 attention_mask: torch.Tensor,
+                                 verbose: bool = True):
         relevant_token_ids = {'output': [], 'target': [], 'input': []}
+
         # QuReTec is a binary classifier. The paper does say it uses a sigmoid layer, but it does not say how to get to
         # an output of zeros and ones. Rounding makes sense, i.e. splitting on 0.5
-        rounded_output = output_tensor.round()
+        rounded_output = output_tensor.float().round()
         for idx, token_id in enumerate(input_token_ids):
             token_id_int = int(token_id)
             if attention_mask[idx] == 1.0:
@@ -318,63 +308,103 @@ class QueryResolution(BaseComponent):
 
         if verbose:
             relevant_tokens = {k: self.tokenizer.convert_ids_to_tokens(ids=relevant_token_ids[k]) for k in relevant_token_ids}
-            logger.info(f'\nGiven history: {" ".join(self.tokenizer.convert_ids_to_tokens(ids=input_token_ids)).replace(" [PAD]", "")}\n'
+            logger.info(f'\nGiven input: {" ".join(self.tokenizer.convert_ids_to_tokens(ids=input_token_ids)).replace(" [PAD]", "")}\n'
                         f'and attention: {str(self.tokenizer.convert_ids_to_tokens(ids=relevant_token_ids["input"]))}\n'
                         f'and target     {str(relevant_tokens["target"])}\n'
                         f'the result is: {str(relevant_tokens["output"])}')
-        return relevant_token_ids
 
     def dataset_statistics(self,
                  processor,
-                 data_set: str,
+                 metrics: EvalQueryResolution,
+                 data_sets: List[str],
                  batch_size: int = 100,
-                 disable_tqdm: bool = False):
+                 disable_tqdm: bool = False,
+                 debug: bool = True):
         """
         Be able to reproduce the baselines from the published paper.
-        In addition, it computes the number of Table 4: Query resolution datasets statistics.
+        In addition, it computes the Original (all) of Table 4: Query resolution datasets statistics.
         """
         self.model.eval()
-        data_silo = DataSilo(processor=processor, batch_size=batch_size, distributed=False, max_processes=1)
-        data_loader = data_silo.get_data_loader(data_set)
+        data_silo = DataSilo(processor=processor,
+                             batch_size=batch_size,
+                             distributed=False,
+                             max_processes=1,
+                             caching=True,
+                             automatic_loading=False)
 
-        metrics = MicroMetrics()
-        input_lengths = []
-        number_of_positive_terms = []
-        with torch.no_grad():
-            progress_bar = tqdm(data_loader, disable=disable_tqdm)
-            for step, batch in enumerate(progress_bar):
-                for i in range(0, len(batch['input_ids'])):
-                    predicted_tokens = []
-                    gold_tokens = []
-                    target_tensor = batch['target'][i].tolist()
-                    attention_tensor = batch['attention_mask'][i].tolist()
+        for data_set in data_sets:
+            data_loader = data_silo.get_data_loader(data_set)
 
-                    for idx, token_id in enumerate(batch['input_ids'][i]):
-                        token_id_int = int(token_id)
-                        if attention_tensor[idx] == 1.0:
-                            predicted_tokens.append(token_id_int)
-                        if target_tensor[idx] == 1.0:
-                            gold_tokens.append(token_id_int)
+            input_lengths = []
+            number_of_positive_terms = []
+            with torch.no_grad():
+                progress_bar = tqdm(data_loader, disable=disable_tqdm)
+                progress_bar.set_description(f"Computing dataset statistics of the '{data_set}' data set")
 
-                    metrics.add_to_values(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens, counts=False)
+                for step, batch in enumerate(progress_bar):
+                    for i in range(0, len(batch['input_ids'])):
+                        target_tensor = batch['target'][i]
+                        input_ids_tensor = batch['input_ids'][i]
+                        attention_tensor = batch['attention_mask'][i]
+                        # Provide start of words to simulate Original (all) from Table 5 in original paper
+                        predicted_tensor = batch['start_of_words'][i]
 
-                    input_lengths.append(list(batch['start_of_words'][i]).count(1))
-                    number_of_positive_terms.append(list(batch['target'][i]).count(1))
+                        predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=input_ids_tensor.tolist(),
+                                                                                            predicted_tensor=predicted_tensor.tolist(),
+                                                                                            target_tensor=target_tensor.tolist())
+                        metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
 
-        print('\n')  # End the line printed by the progress_bar
-        logger.info(f"Statistics of the '{data_set}' data set. \n"
-                    f"Total queries:  {len(input_lengths)}\n"
-                    f"Total terms:    {np.mean(input_lengths):.2f} +- {np.std(input_lengths):.2f}\n"
-                    f"Positive terms: {np.mean(number_of_positive_terms):.2f} +- {np.std(number_of_positive_terms):.2f}")
-        self._print_metrics(**metrics.calc_metric())
-        self._add_metrics(**metrics.calc_metric())
+                        input_lengths.append(list(batch['start_of_words'][i]).count(1))
+                        number_of_positive_terms.append(list(batch['target'][i]).count(1))
 
-    def eval(self, data_loader, disable_tqdm: bool = False):
+                        if debug and step == 0 and i == 0:
+                            self._print_classifier_result(input_token_ids=input_ids_tensor,
+                                                          target_tensor=target_tensor,
+                                                          output_tensor=predicted_tensor,
+                                                          attention_mask=attention_tensor,
+                                                          verbose=True)
+                            logger.info(f"The items used for metrics are: \n"
+                                        f"Predicted words: {predicted_tokens}\n"
+                                        f"Gold tokens: {gold_tokens}")
+
+            print('\n')  # End the line printed by the progress_bar
+            logger.info(f"Statistics of the '{data_set}' data set. \n"
+                        f"Total queries:  {len(input_lengths)}\n"
+                        f"Total terms:    {np.mean(input_lengths):.2f} +- {np.std(input_lengths):.2f}\n"
+                        f"Positive terms: {np.mean(number_of_positive_terms):.2f} +- {np.std(number_of_positive_terms):.2f}")
+            metrics.print(mode="query_resolution", use_logged_values=False)
+            metrics.init_counts()
+
+    def _get_predicted_and_gold_tokens(self, input_ids, predicted_tensor, target_tensor):
+        predicted_terms = []
+        gold_terms = []
+        for idx, token_id in enumerate(input_ids):
+            if predicted_tensor[idx] == 1.0 or target_tensor[idx] == 1.0:
+                # Paper says: "We apply lowercase, lemmatization and stopword removal to qi∗,
+                # q1:i−1 and qi using Spacy12 before calculating term overlap in Equation 2.", so
+                # lemmatise the full word and remove non-stopwords
+                full_word, _, _, parsed = get_full_word(tokenizer=self.tokenizer,
+                                                        input_ids=input_ids,
+                                                        pos=idx,
+                                                        parse=True)
+
+                # Check if the non-lemmatised full word is in stop words, since the Spacy stopwords set
+                # does not contain lemmatised words.
+                if parsed.is_stop is False and parsed.is_punct is False:
+                    if predicted_tensor[idx] == 1.0:
+                        predicted_terms.append(parsed.lemma_)
+                    if target_tensor[idx] == 1.0:
+                        gold_terms.append(parsed.lemma_)
+        return predicted_terms, gold_terms
+
+    def eval(self,
+             data_loader,
+             metrics: EvalQueryResolution,
+             disable_tqdm: bool = False):
         self.model.to(self.device)
         self.model.eval()
 
         t0 = time.time()
-        metrics = MicroMetrics()
 
         with torch.no_grad():
             progress_bar = tqdm(data_loader, disable=disable_tqdm)
@@ -382,7 +412,7 @@ class QueryResolution(BaseComponent):
             for step, batch in enumerate(progress_bar):
                 # Calculate elapsed time in minutes.
                 elapsed = datetime.timedelta(seconds=int(round(time.time() - t0)))
-                progress_bar.set_description(f"Evaluating. Elapsed: {elapsed}")
+                progress_bar.set_description(f"Evaluating in progress. Elapsed: {elapsed}")
 
                 # Move batch of samples to device
                 batch = {key: batch[key].to(self.device) for key in batch}
@@ -392,27 +422,18 @@ class QueryResolution(BaseComponent):
                                      )
                 sigmoid_outputs = self.sigmoid(outputs).detach()
                 for i in range(0, len(batch['input_ids'])):
-                    relevant_tokens = self._get_classifier_result(input_token_ids=batch['input_ids'][i],
-                                                                  attention_mask=batch['attention_mask'][i],
-                                                                  target_tensor=batch['target'][i],
-                                                                  output_tensor=sigmoid_outputs[i],
-                                                                  verbose=False)
-                    metrics.add_to_values(predicted_tokens=relevant_tokens['output'], gold_tokens=relevant_tokens['target'])
-        print('\n')  # End the line printed by the progress_bar
-        self._print_metrics(**metrics.calc_metric())
-        self._add_metrics(**metrics.calc_metric())
+                    predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=batch['input_ids'][i].tolist(),
+                                                                                        predicted_tensor=sigmoid_outputs[i].float().round().tolist(),
+                                                                                        target_tensor=batch['target'][i].tolist()
+                                                                                        )
+                    metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
+        progress_bar.close()
+        logger.info("Printing metrics")
+        metrics.print(mode="query_resolution", use_logged_values=False)
+        metrics.add_to_log()
+        return metrics
 
-    def _print_metrics(self, micro_recall, micro_precision, micro_f1):
-        logger.info(f"\nMicro recall   : {micro_recall:.5f} ({(micro_recall - self._prev_eval_results['r'][-1]):.5f})\n"
-                    f"Micro precision: {micro_precision:.5f} ({(micro_precision - self._prev_eval_results['p'][-1]):.5f})\n"
-                    f"Micro F1       : {micro_f1:.5f} ({(micro_f1 - self._prev_eval_results['f1'][-1]):.5f})\n")
-
-    def _add_metrics(self, micro_recall, micro_precision, micro_f1):
-        self._prev_eval_results['p'].append(micro_precision)
-        self._prev_eval_results['r'].append(micro_recall)
-        self._prev_eval_results['f1'].append(micro_f1)
-
-    def rewrite(self, question: str, history):
+    def resolve(self, question: str, history):
         """
         Rewrite a single question + history ad hoc instead of using a data set.
         """

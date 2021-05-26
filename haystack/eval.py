@@ -17,7 +17,8 @@ class EvalRetriever:
     since that is a closed domain evaluation. Have a look at our evaluation tutorial for more info about
     open vs closed domain eval (https://haystack.deepset.ai/docs/latest/tutorial5md).
     """
-    def __init__(self, debug: bool=False, open_domain: bool=True):
+
+    def __init__(self, debug: bool = False, open_domain: bool = True):
         """
         :param open_domain: When True, a document is considered correctly retrieved so long as the answer string can be found within it.
                             When False, correct retrieval is evaluated based on document_id.
@@ -63,7 +64,8 @@ class EvalRetriever:
         self.correct_retrieval_count += correct_retrieval
         self.recall = self.correct_retrieval_count / self.query_count
         if self.debug:
-            self.log.append({"documents": documents, "labels": labels, "correct_retrieval": correct_retrieval, **kwargs})
+            self.log.append(
+                {"documents": documents, "labels": labels, "correct_retrieval": correct_retrieval, **kwargs})
         return {"documents": documents, "labels": labels, "correct_retrieval": correct_retrieval, **kwargs}, "output_1"
 
     def is_correctly_retrieved(self, retriever_labels, predictions):
@@ -103,7 +105,7 @@ class EvalReader:
     open vs closed domain eval (https://haystack.deepset.ai/docs/latest/tutorial5md).
     """
 
-    def __init__(self, skip_incorrect_retrieval: bool=True, open_domain: bool=True, debug: bool=False):
+    def __init__(self, skip_incorrect_retrieval: bool = True, open_domain: bool = True, debug: bool = False):
         """
         :param skip_incorrect_retrieval: When set to True, this eval will ignore the cases where the retriever returned no correct documents
         :param open_domain: When True, extracted answers are evaluated purely on string similarity rather than the position of the extracted answer
@@ -180,7 +182,7 @@ class EvalReader:
             top_k_f1 = max([calculate_f1_str_multi(gold_labels_list, p) for p in predictions_str])
         else:
             logger.error("Closed Domain Reader Evaluation not yet implemented")
-            return 0,0,0,0
+            return 0, 0, 0, 0
         return top_1_em, top_1_f1, top_k_em, top_k_f1
 
     def update_has_answer_metrics(self):
@@ -227,6 +229,105 @@ class EvalReader:
                 )
 
 
+class EvalQueryResolution:
+    micro_recall_key = 'micro_recall'
+    micro_precision_key = 'micro_precision'
+    micro_f1_key = 'micro_f1'
+
+    """
+    This is a pipeline node that should be placed after a QueryResolution module.
+    """
+
+    def __init__(self, use_counts: bool):
+        self.use_counts = use_counts
+        self.init_counts()
+        self.log = {
+            EvalQueryResolution.micro_recall_key: [0.],
+            EvalQueryResolution.micro_precision_key: [0.],
+            EvalQueryResolution.micro_f1_key: [0.],
+        }
+
+    def init_counts(self):
+        logger.info("Metrics are reset")
+        self.true_pos = 0.0
+        self.false_pos = 0.0
+        self.false_neg = 0.0
+
+    def run(self, predicted_tokens, gold_tokens):
+        """Run this node on one sample and its labels"""
+        predicted_count = {i: predicted_tokens.count(i) if self.use_counts else 1 for i in predicted_tokens}
+        gold_count = {i: gold_tokens.count(i) if self.use_counts else 1 for i in gold_tokens}
+        fp, tp, fn = 0, 0, 0
+
+        for i in predicted_count:
+            if i not in gold_count:
+                fp += predicted_count[i]
+            elif predicted_count[i] >= gold_count[i]:
+                tp += gold_count[i]
+                fp += predicted_count[i] - gold_count[i]
+            elif predicted_count[i] < gold_count[i]:
+                tp += predicted_count[i]
+                fn += gold_count[i] - predicted_count[i]
+        # Some id might have never been predicted
+        for i in gold_count:
+            if i not in predicted_count:
+                fn += gold_count[i]
+
+        self.true_pos += tp
+        self.false_pos += fp
+        self.false_neg += fn
+
+    def calc_metric(self):
+        logger.info(f"Calculating metrics in {self.__class__.__name__} with "
+                    f"tp={self.true_pos}, fp={self.false_pos}, fn={self.false_neg}")
+
+        micro_recall = self.true_pos / (self.true_pos + self.false_neg)
+        if self.true_pos + self.false_pos == 0:
+            micro_precision = 0
+        else:
+            micro_precision = self.true_pos / (self.true_pos + self.false_pos)
+
+        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
+        return {
+            EvalQueryResolution.micro_recall_key: micro_recall * 100,
+            EvalQueryResolution.micro_precision_key: micro_precision * 100,
+            EvalQueryResolution.micro_f1_key: micro_f1 * 100
+        }
+
+    def add_to_log(self):
+        result = self.calc_metric()
+        for k in result:
+            self.log[k].append(result[k])
+        self.init_counts()
+
+    def print(self, use_logged_values: bool, mode: str):
+        if use_logged_values is False:
+            result = self.calc_metric()
+            micro_recall = result[EvalQueryResolution.micro_recall_key]
+            micro_precision = result[EvalQueryResolution.micro_precision_key]
+            micro_f1 = result[EvalQueryResolution.micro_f1_key]
+            micro_recall_diff = micro_recall - self.log[EvalQueryResolution.micro_recall_key][-1]
+            micro_precision_diff = micro_precision - self.log[EvalQueryResolution.micro_precision_key][-1]
+            micro_f1_diff = micro_f1 - self.log[EvalQueryResolution.micro_f1_key][-1]
+        else:
+            micro_recall = self.log[EvalQueryResolution.micro_recall_key][-1]
+            micro_precision = self.log[EvalQueryResolution.micro_precision_key][-1]
+            micro_f1 = self.log[EvalQueryResolution.micro_f1_key][-1]
+            micro_recall_diff = micro_recall - self.log[EvalQueryResolution.micro_recall_key][-2]
+            micro_precision_diff = micro_precision - self.log[EvalQueryResolution.micro_precision_key][-2]
+            micro_f1_diff = micro_f1 - self.log[EvalQueryResolution.micro_f1_key][-2]
+
+        logger.info(f"\n"
+                    f"Micro recall   : {micro_recall:.4f} ({micro_recall_diff:.4f})\n"
+                    f"Micro precision: {micro_precision:.4f} ({micro_precision_diff:.4f})\n"
+                    f"Micro F1       : {micro_f1:.4f} ({micro_f1_diff:.4f})")
+
+    def has_no_improvement(self):
+        data = self.log[EvalQueryResolution.micro_f1_key]
+        # If the F1 score decreases 3 times in row, there is no improvement.
+        return len(data) >= 3 and data[-1] < data[-2] < data[-3]
+
+
 def calculate_em_str_multi(gold_labels, prediction):
     for gold_label in gold_labels:
         result = calculate_em_str(gold_label, prediction)
@@ -247,18 +348,18 @@ def calculate_reader_metrics(metric_counts: Dict[str, float], correct_retrievals
     number_of_has_answer = correct_retrievals - metric_counts["number_of_no_answer"]
 
     metrics = {
-        "reader_top1_accuracy" : metric_counts["correct_readings_top1"] / correct_retrievals,
-        "reader_top1_accuracy_has_answer" : metric_counts["correct_readings_top1_has_answer"] / number_of_has_answer,
-        "reader_topk_accuracy" : metric_counts["correct_readings_topk"] / correct_retrievals,
-        "reader_topk_accuracy_has_answer" : metric_counts["correct_readings_topk_has_answer"] / number_of_has_answer,
-        "reader_top1_em" : metric_counts["exact_matches_top1"] / correct_retrievals,
-        "reader_top1_em_has_answer" : metric_counts["exact_matches_top1_has_answer"] / number_of_has_answer,
-        "reader_topk_em" : metric_counts["exact_matches_topk"] / correct_retrievals,
-        "reader_topk_em_has_answer" : metric_counts["exact_matches_topk_has_answer"] / number_of_has_answer,
-        "reader_top1_f1" : metric_counts["summed_f1_top1"] / correct_retrievals,
-        "reader_top1_f1_has_answer" : metric_counts["summed_f1_top1_has_answer"] / number_of_has_answer,
-        "reader_topk_f1" : metric_counts["summed_f1_topk"] / correct_retrievals,
-        "reader_topk_f1_has_answer" : metric_counts["summed_f1_topk_has_answer"] / number_of_has_answer,
+        "reader_top1_accuracy": metric_counts["correct_readings_top1"] / correct_retrievals,
+        "reader_top1_accuracy_has_answer": metric_counts["correct_readings_top1_has_answer"] / number_of_has_answer,
+        "reader_topk_accuracy": metric_counts["correct_readings_topk"] / correct_retrievals,
+        "reader_topk_accuracy_has_answer": metric_counts["correct_readings_topk_has_answer"] / number_of_has_answer,
+        "reader_top1_em": metric_counts["exact_matches_top1"] / correct_retrievals,
+        "reader_top1_em_has_answer": metric_counts["exact_matches_top1_has_answer"] / number_of_has_answer,
+        "reader_topk_em": metric_counts["exact_matches_topk"] / correct_retrievals,
+        "reader_topk_em_has_answer": metric_counts["exact_matches_topk_has_answer"] / number_of_has_answer,
+        "reader_top1_f1": metric_counts["summed_f1_top1"] / correct_retrievals,
+        "reader_top1_f1_has_answer": metric_counts["summed_f1_top1_has_answer"] / number_of_has_answer,
+        "reader_topk_f1": metric_counts["summed_f1_topk"] / correct_retrievals,
+        "reader_topk_f1_has_answer": metric_counts["summed_f1_topk_has_answer"] / number_of_has_answer,
     }
 
     if metric_counts["number_of_no_answer"]:
@@ -316,8 +417,10 @@ def eval_counts_reader(question: MultiLabel, predicted_answers: Dict[str, Any], 
         for answer_idx, answer in enumerate(predicted_answers["answers"]):
             if answer["document_id"] in question.multiple_document_ids:
                 gold_spans = [{"offset_start": question.multiple_offset_start_in_docs[i],
-                               "offset_end": question.multiple_offset_start_in_docs[i] + len(question.multiple_answers[i]),
-                               "doc_id": question.multiple_document_ids[i]} for i in range(len(question.multiple_answers))]  # type: ignore
+                               "offset_end": question.multiple_offset_start_in_docs[i] + len(
+                                   question.multiple_answers[i]),
+                               "doc_id": question.multiple_document_ids[i]} for i in
+                              range(len(question.multiple_answers))]  # type: ignore
                 predicted_span = {"offset_start": answer["offset_start_in_doc"],
                                   "offset_end": answer["offset_end_in_doc"],
                                   "doc_id": answer["document_id"]}
@@ -326,11 +429,13 @@ def eval_counts_reader(question: MultiLabel, predicted_answers: Dict[str, Any], 
                     if gold_span["doc_id"] == predicted_span["doc_id"]:
                         # check if overlap between gold answer and predicted answer
                         if not found_answer:
-                            metric_counts, found_answer = _count_overlap(gold_span, predicted_span, metric_counts, answer_idx)  # type: ignore
+                            metric_counts, found_answer = _count_overlap(gold_span, predicted_span, metric_counts,
+                                                                         answer_idx)  # type: ignore
 
                         # check for exact match
                         if not found_em:
-                            metric_counts, found_em = _count_exact_match(gold_span, predicted_span, metric_counts, answer_idx)  # type: ignore
+                            metric_counts, found_em = _count_exact_match(gold_span, predicted_span, metric_counts,
+                                                                         answer_idx)  # type: ignore
 
                         # calculate f1
                         current_f1 = _calculate_f1(gold_span, predicted_span)  # type: ignore
@@ -369,7 +474,8 @@ def eval_counts_reader_batch(pred: Dict[str, Any], metric_counts: Dict[str, floa
             # check if correct document:
             if answer["document_id"] in pred["label"].multiple_document_ids:
                 gold_spans = [{"offset_start": pred["label"].multiple_offset_start_in_docs[i],
-                               "offset_end": pred["label"].multiple_offset_start_in_docs[i] + len(pred["label"].multiple_answers[i]),
+                               "offset_end": pred["label"].multiple_offset_start_in_docs[i] + len(
+                                   pred["label"].multiple_answers[i]),
                                "doc_id": pred["label"].multiple_document_ids[i]}
                               for i in range(len(pred["label"].multiple_answers))]  # type: ignore
                 predicted_span = {"offset_start": answer["offset_start_in_doc"],
@@ -416,17 +522,17 @@ def eval_counts_reader_batch(pred: Dict[str, Any], metric_counts: Dict[str, floa
 
 
 def _count_overlap(
-    gold_span: Dict[str, Any],
-    predicted_span: Dict[str, Any],
-    metric_counts: Dict[str, float],
-    answer_idx: int
-    ):
+        gold_span: Dict[str, Any],
+        predicted_span: Dict[str, Any],
+        metric_counts: Dict[str, float],
+        answer_idx: int
+):
     # Checks if overlap between prediction and real answer.
 
     found_answer = False
 
     if (gold_span["offset_start"] <= predicted_span["offset_end"]) and \
-       (predicted_span["offset_start"] <= gold_span["offset_end"]):
+            (predicted_span["offset_start"] <= gold_span["offset_end"]):
         # top-1 answer
         if answer_idx == 0:
             metric_counts["correct_readings_top1"] += 1
@@ -440,18 +546,18 @@ def _count_overlap(
 
 
 def _count_exact_match(
-    gold_span: Dict[str, Any],
-    predicted_span: Dict[str, Any],
-    metric_counts: Dict[str, float],
-    answer_idx: int
-    ):
+        gold_span: Dict[str, Any],
+        predicted_span: Dict[str, Any],
+        metric_counts: Dict[str, float],
+        answer_idx: int
+):
     # Check if exact match between prediction and real answer.
     # As evaluation needs to be framework independent, we cannot use the farm.evaluation.metrics.py functions.
 
     found_em = False
 
     if (gold_span["offset_start"] == predicted_span["offset_start"]) and \
-       (gold_span["offset_end"] == predicted_span["offset_end"]):
+            (gold_span["offset_end"] == predicted_span["offset_end"]):
         if metric_counts:
             # top-1 answer
             if answer_idx == 0:

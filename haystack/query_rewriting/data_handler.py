@@ -1,34 +1,61 @@
 import os
 import logging
-from collections import defaultdict
 
 import numpy as np
 import json
 # Use external dependency Spacy, because QuReTec also uses Spacy
 import spacy
 
-from datasets import load_dataset, ReadInstruction
 from farm.data_handler.processor import Processor
 from farm.data_handler.samples import Sample
 from farm.data_handler.utils import pad
 from farm.modeling.tokenization import truncate_sequences
+from spacy.tokens import Token
 from transformers import BertTokenizer
 from typing import List
 
 
 logger = logging.getLogger(__name__)
+nlp = spacy.load("en_core_web_sm")
+
+cached_parsed_spacy_token = {}
 
 
-def add_rewrites(d, canard_key):
-    d.update({'source': canard_key})
-    return d
+def get_full_word(tokenizer, input_ids: List, pos: int, parse: bool, skip_positions: List[int] = None):
+    """
+
+    """
+    end_of_input = len(input_ids)
+    token_string = tokenizer.convert_ids_to_tokens(input_ids[pos])
+    running_word = token_string
+    extra = 0
+
+    # Prevent looping past the end of the sentence or over special tokens positions
+    while pos + extra + 1 < end_of_input and (skip_positions is None or pos + extra + 1 not in skip_positions):
+        next_token_string = tokenizer.convert_ids_to_tokens(input_ids[pos + extra + 1])
+        second_next_token_string = None
+        if pos + extra + 2 < end_of_input:
+            second_next_token_string = tokenizer.convert_ids_to_tokens(input_ids[pos + extra + 2])
+        if next_token_string[:2] == '##':
+            extra += 1
+            running_word += next_token_string.replace("##", "")
+        # elif next_token_string[0] == "'" and second_next_token_string == 's':
+        #     extra += 2
+        #     running_word += next_token_string + second_next_token_string
+        else:
+            break
+
+    parsed_doc = None  # type: Token
+    if parse:
+        if running_word not in cached_parsed_spacy_token:
+            cached_parsed_spacy_token[running_word] = nlp(running_word)[0]
+        parsed_doc = cached_parsed_spacy_token[running_word]
+    return running_word, token_string, extra, parsed_doc
+
 
 def qurectec_sample_to_features_text(sample: Sample,
                                      max_seq_len: int,
                                      tokenizer: BertTokenizer,
-                                     preprocessor,
-                                     distant_supervision: bool,
-                                     pad_on_left = False,
                                      debugging = True,
                                      include_current_turn_in_attention = False
                                      ) -> List[dict]:
@@ -43,7 +70,7 @@ def qurectec_sample_to_features_text(sample: Sample,
     """
     inputs = sample.tokenized
     input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
-
+    gold_terms = sample.clear_text[CanardProcessor.gold_terms]
     special_tokens_positions = np.where(np.array(inputs['special_tokens_mask']) == 1)[0]
 
     # The mask has 1 for real tokens and 0 for padding tokens. Only real tokens are attended to.
@@ -58,28 +85,7 @@ def qurectec_sample_to_features_text(sample: Sample,
     # here, so it is available during the training loop
     target = [0] * len(input_ids)
 
-    # Bert tokenizers start of words are different from Spacy, but we need the one from Spacy
     start_of_word = [0] * len(input_ids)
-
-    if distant_supervision:
-        source_of_relevance = [t.lemma for t in preprocessor(sample.clear_text[CanardProcessor.context_key])]
-    else:
-        # Otherwise use gold standard rewrites from the CANARD dataset
-        source_of_relevance = [t.lemma for t in preprocessor(sample.clear_text[CanardProcessor.rewrite_key])]
-
-    parsed_prev_questions = preprocessor(" ".join(sample.clear_text[CanardProcessor.previous_question_key]))
-    parsed_prev_questions_text = [t.lower_ for t in parsed_prev_questions]
-    current_question = [t.lemma for t in preprocessor(sample.clear_text[CanardProcessor.label_name_key])]
-    current_question_text = [t.lower_ for t in preprocessor(sample.clear_text[CanardProcessor.label_name_key])]
-    potentials_words = []
-    for t in parsed_prev_questions:
-        # QuReTec quotation: "We apply lowercase, lemmatization and stop-word removal to qi∗, q1:i−1 and qi using Spacy
-        # before calculating term overlap in Equation 2"
-
-        # If a term in the question history is present in the question context/history and not in the current question,
-        # then the term is relevant
-        if t.is_stop is False and t.lemma in source_of_relevance and t.lemma not in current_question:
-            potentials_words.append(t.lower_)
 
     target_tokens, not_target_tokens = [], []  # for during debugging
 
@@ -94,32 +100,28 @@ def qurectec_sample_to_features_text(sample: Sample,
                 bert_pos += 1
                 continue
 
-            start_of_word[bert_pos] = 1
-            token_string = tokenizer.convert_ids_to_tokens(input_ids[bert_pos])
-            running_word = token_string
+            running_word, token_string, extra, _ = get_full_word(input_ids=input_ids,
+                                                                 tokenizer=tokenizer,
+                                                                 pos=bert_pos,
+                                                                 skip_positions=special_tokens_positions,
+                                                                 parse=False)
 
-            extra = 0
-            spacy_word = parsed_prev_questions_text[running_spacy_idx] if bert_pos <= end_for_attention_mask else current_question_text[running_spacy_idx]
-            # Prevent looping past the end of the sentence or over special tokens positions
-            while len(running_word) < len(spacy_word) and bert_pos + extra < end_of_input and bert_pos + extra + 1 not in special_tokens_positions:
-                extra += 1
-                running_word += tokenizer.convert_ids_to_tokens(input_ids[bert_pos + extra]).replace("##", "")
+            start_of_word[bert_pos] = 1
 
             if bert_pos < end_for_attention_mask:
+                is_punctuation_mark = running_word in ['?', ',', '-', '.', '(', ')', '_', "'", '"']
 
-                is_not_punctuation_mark = running_word not in ['?', ',', '-', '.', '(', ')', '_', "'", '"']
-                if is_not_punctuation_mark:
-                    # Cannot find this in paper, but also not put attention on stop word.
-                    # Only put attention on start of words, since the paper says "The term classification
-                    # layer is applied on top of the representation of the first sub-token of each term"
+                # Only put attention on start of words, since the paper says "The term classification
+                # layer is applied on top of the representation of the first sub-token of each term"
+                if not is_punctuation_mark: # and running_word not in nlp.Defaults.stop_words:
                     attention_mask[bert_pos] = 1
 
-                if running_word in potentials_words and is_not_punctuation_mark:
-                    target[bert_pos] = 1
-                    if debugging:
-                        target_tokens.append(token_string)
-                elif debugging:
-                    not_target_tokens.append(token_string)
+                    if running_word in gold_terms:
+                        target[bert_pos] = 1
+                        if debugging:
+                            target_tokens.append(token_string)
+                    elif debugging:
+                        not_target_tokens.append(token_string)
             running_spacy_idx += 1
             bert_pos += 1 + extra
     except IndexError as e:
@@ -127,6 +129,7 @@ def qurectec_sample_to_features_text(sample: Sample,
     del bert_pos, running_spacy_idx, end_for_attention_mask, end_of_input
 
     # Padding up to the sequence length.
+    pad_on_left = False
     token_type_ids = pad(token_type_ids, max_seq_len, 0, pad_on_left=pad_on_left)
     input_ids = pad(input_ids, max_seq_len, tokenizer.pad_token_id, pad_on_left=pad_on_left)
     padding_mask = pad(padding_mask, max_seq_len, 0, pad_on_left=pad_on_left)
@@ -185,11 +188,14 @@ def quretec_tokenize_with_metadata(text_including_special_tokens: str, max_seq_l
             }
 
 
+base = os.path.dirname(os.path.abspath(__file__))
+
+
 class CanardProcessor(Processor):
     label_name_key = "question"
     previous_question_key = "previous_questions"
     context_key = "context"
-    rewrite_key = "rewrite"
+    gold_terms = "gold"
     """
     Used to handle the QuAC that come in json format.
     For more details on the dataset format, please visit: https://huggingface.co/datasets/quac
@@ -202,33 +208,29 @@ class CanardProcessor(Processor):
                  train_split: int = None,
                  test_split: int = None,
                  dev_split: int = None,
-                 distant_supervision = False,
-                 use_first_questions = False,
-                 verbose = True,
-                 include_current_turn_in_attention = False,
+                 verbose: bool = True,
+                 include_current_turn_in_attention: bool = False,
+                 data_dir=base + '/canard/voskarides_preprocessed',
+                 train_filename: str = 'train_gold_supervision.json',
+                 test_filename: str = 'test_gold_supervision.json',
+                 dev_filename: str = 'dev_gold_supervision.json',
                  ):
-        self._distant_supervision = distant_supervision
         self._include_current_turn_in_attention = include_current_turn_in_attention
         self._verbose = verbose
 
         # Always log this, so users have a log of the settings of their experiments
-        logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len},"
-                    f"distant_supervision={distant_supervision}, use_first_questions={use_first_questions}"
-                    )
+        logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}, "
+                    f"include_current_turn_in_attention={include_current_turn_in_attention}")
 
-        base = os.path.dirname(os.path.abspath(__file__))
-        data_dir = base+'/canard'
-        train_filename = data_dir + '/train.json'
-        test_filename = data_dir + '/test.json'
-        dev_filename = data_dir + '/dev.json'
+        train_filename = data_dir + '/' + train_filename
+        test_filename = data_dir + '/' + test_filename
+        dev_filename = data_dir + '/' + dev_filename
+
         self.datasets = {
             'train': json.load(open(train_filename))[0:train_split],
             'test': json.load(open(test_filename))[0:test_split],
             'dev': json.load(open(dev_filename))[0:dev_split]
         }
-        for key in self.datasets:
-            self.datasets[key] = [d for d in self.datasets[key] if (use_first_questions or d['Question_no'] > 1)]
-
         super(CanardProcessor, self).__init__(tokenizer=tokenizer,
                                               max_seq_len=max_seq_len,
                                               train_filename=train_filename,
@@ -244,12 +246,6 @@ class CanardProcessor(Processor):
                       task_type="classification",
                       label_list=['target']
                       )
-
-        # Please install this via terminal command "python3 -m spacy download en_core_web_sm"
-        self._preprocessor = spacy.load("en_core_web_sm",
-                                        disable=["parser", "textcat"]  # see https://spacy.io/usage/processing-pipelines
-                                        )
-
 
     def file_to_dicts(self, file: str) -> [dict]:
 
@@ -279,8 +275,9 @@ class CanardProcessor(Processor):
         # Create a sample for each question
         samples = []
 
-        question = dictionary['Question']
-        history = dictionary['History']
+        question = dictionary['cur_question'].lower()
+        history = [dictionary['prev_questions'].lower()]
+        gold_terms = dictionary['gold_terms']
 
         # BERT model requires the tokenized text to start with a CLS token and end with a SEP token
         # The authors of QuReTec by Voskarides et al. decided to seperate the history and the current question
@@ -304,17 +301,11 @@ class CanardProcessor(Processor):
                                                            with_special_tokens=False,  # False, because it already contains special tokens
                                                            stride=0)
 
-        samples.append(Sample(id=f"{dictionary['QuAC_dialog_id']}#q{dictionary['Question_no']}",
+        samples.append(Sample(id=f"{dictionary['id']}",
                               clear_text={
                                   CanardProcessor.label_name_key: question,
                                   'tokenized_text': tokenized_text,
-                                  CanardProcessor.previous_question_key: history,
-                                  CanardProcessor.context_key: '',  # TODO get context from quac from QUAC
-                                  CanardProcessor.rewrite_key: dictionary['Rewrite'],
-                                  # 'answer': dictionary['orig_answers']['texts'][index],
-                                  # 'answer_start': dictionary['orig_answers']['answer_starts'][index],
-                                  # 'section_title': dictionary['section_title'],
-                                  # 'wikipedia_page_title': dictionary['wikipedia_page_title'],
+                                  CanardProcessor.gold_terms: gold_terms,
                               },
                               tokenized=tokenized)
                        )
@@ -328,8 +319,6 @@ class CanardProcessor(Processor):
             sample=sample,
             max_seq_len=self.max_seq_len,
             tokenizer=self.tokenizer,
-            preprocessor=self._preprocessor,
-            distant_supervision=self._distant_supervision,
             include_current_turn_in_attention=self._include_current_turn_in_attention
         )
 
