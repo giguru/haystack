@@ -47,7 +47,7 @@ def train():
     query_resolution = QueryResolution(model_args={'dropout_prob': 0.1}, use_gpu=True)
     processor = CanardProcessor(tokenizer=query_resolution.tokenizer,
                                 max_seq_len=512,
-                                train_split=None,
+                                train_split=500,
                                 test_split=None,
                                 dev_split=None,
                                 include_current_turn_in_target=False)
@@ -93,5 +93,6 @@ def evaluate():
     data_silo = DataSilo(processor=processor, batch_size=100, distributed=False, max_processes=1)
     query_resolution.eval(data_silo.get_data_loader('test'), metrics=EvalQueryResolution(use_counts=True))
 
-data_set_statistics()
+
+train()
 exit()

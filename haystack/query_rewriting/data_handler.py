@@ -73,13 +73,13 @@ def qurectec_sample_to_features_text(sample: Sample,
     gold_terms = sample.clear_text[CanardProcessor.gold_terms]
     special_tokens_positions = np.where(np.array(inputs['special_tokens_mask']) == 1)[0]
 
-    attention_mask = [0] * len(input_ids)
+    # Put attention on everything that is not padding.
+    attention_mask = [1] * len(input_ids)
 
     # Because of the structure of haystack, you don't have access to the sample data in the training loop. However,
     # the target vector required for computing the loss for QuReTec is not in QuAC. So create the target vector
     # here, so it is available during the training loop
     target = [0] * len(input_ids)
-
     start_of_word = [0] * len(input_ids)
 
     target_tokens, not_target_tokens = [], []  # for during debugging
@@ -103,19 +103,14 @@ def qurectec_sample_to_features_text(sample: Sample,
                                                                  parse=False)
             start_of_word[bert_pos] = 1
             if bert_pos < end_for_target:
-                is_punctuation_mark = running_word in ['?', ',', '-', '.', '(', ')', '_', "'", '"']
-
                 # Only target the start of words, since the paper says "The term classification
                 # layer is applied on top of the representation of the first sub-token of each term"
-                if not is_punctuation_mark: # and running_word not in nlp.Defaults.stop_words:
-                    attention_mask[bert_pos] = 1
-
-                    if running_word in gold_terms:
-                        target[bert_pos] = 1
-                        if debugging:
-                            target_tokens.append(token_string)
-                    elif debugging:
-                        not_target_tokens.append(token_string)
+                if running_word in gold_terms:
+                    target[bert_pos] = 1
+                    if debugging:
+                        target_tokens.append(token_string)
+                elif debugging:
+                    not_target_tokens.append(token_string)
             running_spacy_idx += 1
             bert_pos += 1 + extra
     except IndexError as e:
@@ -157,7 +152,7 @@ def quretec_tokenize_with_metadata(text_including_special_tokens: str, max_seq_l
                            add_special_tokens=False  # The provided text already has special tokens
                            )
 
-    tokens2 = tokenized2["input_ids"]
+    input_ids = tokenized2["input_ids"]
     offsets2 = np.array([x[0] for x in tokenized2["offset_mapping"]])
     words = np.array(tokenized2.encodings[0].words)
 
@@ -170,11 +165,17 @@ def quretec_tokenize_with_metadata(text_including_special_tokens: str, max_seq_l
     # The bert tokenizer does not find special tokens that are in the text to be tokenized, so overwrite special tokens
     # mask manually
     special_tokens_mask = tokenizer.get_special_tokens_mask(tokenized2['input_ids'], already_has_special_tokens=True)
-    return {"tokens": tokens2,
+
+    token_type_ids = [0] * len(input_ids)
+    special_tokens_positions = np.where(np.array(special_tokens_mask) == 1)[0]
+    for idx in range(special_tokens_positions[1], special_tokens_positions[2]):
+        token_type_ids[idx] = 1
+
+    return {"tokens": input_ids,
             "offsets": offsets2,
             "start_of_word": start_of_word2,
-            "input_ids": tokenized2['input_ids'],
-            'token_type_ids': tokenized2['token_type_ids'],
+            "input_ids": input_ids,
+            'token_type_ids': token_type_ids,
             'special_tokens_mask': special_tokens_mask,
             }
 
@@ -278,7 +279,7 @@ class CanardProcessor(Processor):
                                                    max_seq_len=self.max_seq_len,
                                                    tokenizer=self.tokenizer)
 
-        if len(tokenized["tokens"]) == 0:
+        if len(tokenized["input_ids"]) == 0:
             logger.warning(f"The following text could not be tokenized, likely because it contains a character that the tokenizer does not recognize: {tokenized_text}")
 
         # truncate tokens, offsets and start_of_word to max_seq_len that can be handled by the model.

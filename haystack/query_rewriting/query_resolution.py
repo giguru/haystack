@@ -173,6 +173,7 @@ class QueryResolution(BaseComponent):
 
         self.data_silo = DataSilo(processor=processor,
                                   batch_size=batch_size,
+                                  distributed=False,
                                   max_processes=1,
                                   **datasilo_args
                                   )
