@@ -13,7 +13,7 @@ from farm.modeling.tokenization import truncate_sequences
 from spacy.tokens import Token
 from transformers import BertTokenizer
 from typing import List
-
+import re
 
 logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
@@ -21,173 +21,26 @@ nlp = spacy.load("en_core_web_sm")
 cached_parsed_spacy_token = {}
 
 
-def get_full_word(tokenizer, input_ids: List, pos: int, parse: bool, skip_positions: List[int] = None):
-    """
-
-    """
-    end_of_input = len(input_ids)
-    token_string = tokenizer.convert_ids_to_tokens(input_ids[pos])
-    running_word = token_string
-    extra = 0
-
-    # Prevent looping past the end of the sentence or over special tokens positions
-    while pos + extra + 1 < end_of_input and (skip_positions is None or pos + extra + 1 not in skip_positions):
-        next_token_string = tokenizer.convert_ids_to_tokens(input_ids[pos + extra + 1])
-        second_next_token_string = None
-        if pos + extra + 2 < end_of_input:
-            second_next_token_string = tokenizer.convert_ids_to_tokens(input_ids[pos + extra + 2])
-        if next_token_string[:2] == '##':
-            extra += 1
-            running_word += next_token_string.replace("##", "")
-        # elif next_token_string[0] == "'" and second_next_token_string == 's':
-        #     extra += 2
-        #     running_word += next_token_string + second_next_token_string
-        else:
-            break
-
-    parsed_doc = None  # type: Token
-    if parse:
-        if running_word not in cached_parsed_spacy_token:
-            cached_parsed_spacy_token[running_word] = nlp(running_word)[0]
-        parsed_doc = cached_parsed_spacy_token[running_word]
-    return running_word, token_string, extra, parsed_doc
-
-
-def qurectec_sample_to_features_text(sample: Sample,
-                                     max_seq_len: int,
-                                     tokenizer: BertTokenizer,
-                                     debugging = True,
-                                     include_current_turn_in_target = False
-                                     ) -> List[dict]:
-    """
-    Generates a dictionary of features for a given input sample that is to be consumed by a text classification model.
-
-    :param sample: Sample object that contains human readable text and label fields from a single text classification data sample
-    :param max_seq_len: Sequences are truncated after this many tokens
-    :param tokenizer: A tokenizer object that can turn string sentences into a list of tokens
-    :return: A list with one dictionary containing the keys "input_ids" and "segment_ids" (also "label_ids" if not
-             in inference mode). The values are lists containing those features.
-    """
-    inputs = sample.tokenized
-    input_ids, token_type_ids = inputs["input_ids"], inputs["token_type_ids"]
-    gold_terms = sample.clear_text[CanardProcessor.gold_terms]
-    special_tokens_positions = np.where(np.array(inputs['special_tokens_mask']) == 1)[0]
-
-    # Put attention on everything that is not padding.
-    attention_mask = [1] * len(input_ids)
-
-    # Because of the structure of haystack, you don't have access to the sample data in the training loop. However,
-    # the target vector required for computing the loss for QuReTec is not in QuAC. So create the target vector
-    # here, so it is available during the training loop
-    target = [0] * len(input_ids)
-    start_of_word = [0] * len(input_ids)
-
-    target_tokens, not_target_tokens = [], []  # for during debugging
-
-    # The history starts after the initial [CLS] and ends at the second special token, which is [SEP]
-    end_of_input = len(input_ids)
-    end_for_target = end_of_input if include_current_turn_in_target else special_tokens_positions[1]
-
-    bert_pos, running_spacy_idx = 0, 0
-    try:
-        while bert_pos < end_of_input:
-            if bert_pos in special_tokens_positions:
-                running_spacy_idx = 0
-                bert_pos += 1
-                continue
-
-            running_word, token_string, extra, _ = get_full_word(input_ids=input_ids,
-                                                                 tokenizer=tokenizer,
-                                                                 pos=bert_pos,
-                                                                 skip_positions=special_tokens_positions,
-                                                                 parse=False)
-            start_of_word[bert_pos] = 1
-            if bert_pos < end_for_target:
-                # Only target the start of words, since the paper says "The term classification
-                # layer is applied on top of the representation of the first sub-token of each term"
-                if running_word in gold_terms:
-                    target[bert_pos] = 1
-                    if debugging:
-                        target_tokens.append(token_string)
-                elif debugging:
-                    not_target_tokens.append(token_string)
-            running_spacy_idx += 1
-            bert_pos += 1 + extra
-    except IndexError as e:
-        print(e)
-    del bert_pos, running_spacy_idx, end_for_target, end_of_input
-
-    # Padding up to the sequence length.
-    pad_on_left = False
-    token_type_ids = pad(token_type_ids, max_seq_len, 0, pad_on_left=pad_on_left)
-    input_ids = pad(input_ids, max_seq_len, tokenizer.pad_token_id, pad_on_left=pad_on_left)
-    attention_mask = pad(attention_mask, max_seq_len, 0, pad_on_left=pad_on_left)
-    target = pad(target, max_seq_len, 0, pad_on_left=pad_on_left)
-    start_of_word = pad(start_of_word, max_seq_len, 0, pad_on_left=pad_on_left)
-
-    assert len(input_ids) == max_seq_len, f"The input_ids vector has length {len(input_ids)}"
-    assert len(token_type_ids) == max_seq_len, f"The token_type_ids vector has length {len(token_type_ids)}"
-    assert len(attention_mask) == max_seq_len, f"The attention vector has length {len(attention_mask)}"
-    assert len(start_of_word) == max_seq_len, f"The start_of_word vector has length {len(start_of_word)}"
-    assert len(target) == max_seq_len, f"The target vector has length {len(target)}"
-
-    # Return a list with a features dict
-    return [{
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "start_of_words": start_of_word,
-        "token_type_ids": token_type_ids,
-        "target": target
-    }]
-
-
-def quretec_tokenize_with_metadata(text_including_special_tokens: str, max_seq_len, tokenizer: BertTokenizer) -> dict:
-    tokenized2 = tokenizer(text=text_including_special_tokens,
-                           truncation=True,
-                           truncation_strategy="longest_first",
-                           max_length=max_seq_len,
-                           return_token_type_ids=True,
-                           return_offsets_mapping=True,
-                           return_special_tokens_mask=True,
-                           add_special_tokens=False  # The provided text already has special tokens
-                           )
-
-    input_ids = tokenized2["input_ids"]
-    offsets2 = np.array([x[0] for x in tokenized2["offset_mapping"]])
-    words = np.array(tokenized2.encodings[0].words)
-
-    # TODO check for validity for all tokenizer and special token types
-    words[0] = -1
-    words[-1] = words[-2]
-    words += 1
-    start_of_word2 = [0] + list(np.ediff1d(words))
-
-    # The bert tokenizer does not find special tokens that are in the text to be tokenized, so overwrite special tokens
-    # mask manually
-    special_tokens_mask = tokenizer.get_special_tokens_mask(tokenized2['input_ids'], already_has_special_tokens=True)
-
-    token_type_ids = [0] * len(input_ids)
-    special_tokens_positions = np.where(np.array(special_tokens_mask) == 1)[0]
-    for idx in range(special_tokens_positions[1], special_tokens_positions[2]):
-        token_type_ids[idx] = 1
-
-    return {"tokens": input_ids,
-            "offsets": offsets2,
-            "start_of_word": start_of_word2,
-            "input_ids": input_ids,
-            'token_type_ids': token_type_ids,
-            'special_tokens_mask': special_tokens_mask,
-            }
+def get_spacy_parsed_word(word: str) -> Token:
+    if word not in cached_parsed_spacy_token:
+        cached_parsed_spacy_token[word] = nlp(word)[0]
+    return cached_parsed_spacy_token[word]
 
 
 base = os.path.dirname(os.path.abspath(__file__))
 
 
 class CanardProcessor(Processor):
+
     label_name_key = "question"
-    previous_question_key = "previous_questions"
-    context_key = "context"
     gold_terms = "gold"
+
+    labels = {
+        "NOT_RELEVANT": "O",
+        "RELEVANT": "REL",
+        "[CLS]": "[CLS]",
+        "[SEP]": "[SEP]",
+    }
     """
     Used to handle the QuAC that come in json format.
     For more details on the dataset format, please visit: https://huggingface.co/datasets/quac
@@ -195,24 +48,24 @@ class CanardProcessor(Processor):
     """
 
     def __init__(self,
-                 tokenizer,
-                 max_seq_len=512,  # 512, because that is the maximum number of tokens BERT uses
+                 tokenizer: BertTokenizer,
+                 max_seq_len=300,
                  train_split: int = None,
                  test_split: int = None,
                  dev_split: int = None,
                  verbose: bool = True,
-                 include_current_turn_in_target: bool = False,
                  data_dir=base + '/canard/voskarides_preprocessed',
                  train_filename: str = 'train_gold_supervision.json',
                  test_filename: str = 'test_gold_supervision.json',
                  dev_filename: str = 'dev_gold_supervision.json',
                  ):
-        self._include_current_turn_in_target = include_current_turn_in_target
+        """
+        :param: max_seq_len. The original authors of QuReTec have provided 300 as the max sequence length.
+        """
         self._verbose = verbose
 
         # Always log this, so users have a log of the settings of their experiments
-        logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}, "
-                    f"include_current_turn_in_target={include_current_turn_in_target}")
+        logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}")
 
         train_filename = data_dir + '/' + train_filename
         test_filename = data_dir + '/' + test_filename
@@ -232,12 +85,23 @@ class CanardProcessor(Processor):
                                               dev_split=0,
                                             )
 
-        self.add_task(name="question_rewriting",
+        self.add_task(name="ner",
                       metric="F1",
                       label_name=CanardProcessor.label_name_key,
                       task_type="classification",
-                      label_list=['target']
+                      label_list=self.get_labels()
                       )
+        self.label_to_id = {label: i for i, label in enumerate(self.get_labels(), 1)}
+        self.id_to_label = {i: label for i, label in enumerate(self.get_labels(), 1)}
+
+    @staticmethod
+    def get_labels():
+        return [
+            CanardProcessor.labels['NOT_RELEVANT'],
+            CanardProcessor.labels['RELEVANT'],
+            "[CLS]",
+            "[SEP]"
+        ]
 
     def file_to_dicts(self, file: str) -> [dict]:
 
@@ -255,62 +119,165 @@ class CanardProcessor(Processor):
 
         raise ValueError(f'Please use the training file {train_filename_path}\n, test file {test_filename_path} or dev file {dev_filename_path}')
 
+    def relevant_terms(self, history: str, gold_source: str):
+        word_list = re.findall(r"[\w']+|[.,!?;]", history)
+        gold_list = re.findall(r"[\w']+|[.,!?;]", gold_source)
+        gold_lemmas = set([get_spacy_parsed_word(w).lemma_ for w in gold_list])
+        label_list = []
+
+        for w in word_list:
+            l = get_spacy_parsed_word(w).lemma_
+            if l in gold_lemmas:
+                label_list.append(CanardProcessor.labels['RELEVANT'])
+            else:
+                label_list.append(CanardProcessor.labels['NOT_RELEVANT'])
+
+        return word_list, label_list
+
     def _dict_to_samples(self, dictionary: dict, **kwargs) -> [Sample]:
         """
-        :param dictionary: The dictionary contains the following keys:
-            History
-            QuAC_dialog_id
-            Question
-            Question_no
-            Rewrite
         """
-        # Create a sample for each question
-        samples = []
-
         question = dictionary['cur_question'].lower()
-        history = [dictionary['prev_questions'].lower()]
+        history = dictionary['prev_questions'].lower()
         gold_terms = dictionary['gold_terms']
 
-        # BERT model requires the tokenized text to start with a CLS token and end with a SEP token
-        # The authors of QuReTec by Voskarides et al. decided to seperate the history and the current question
+        # The authors of QuReTec by Voskarides et al. decided to separate the history and the current question
         # with a SEP token
-        tokenized_text = f"{self.tokenizer.cls_token} {' '.join(history)} {self.tokenizer.sep_token} {question} {self.tokenizer.sep_token}"
-        tokenized = quretec_tokenize_with_metadata(text_including_special_tokens=tokenized_text,
-                                                   max_seq_len=self.max_seq_len,
-                                                   tokenizer=self.tokenizer)
+        tokenized_text = f"{history} {self.tokenizer.sep_token} {question}"
 
-        if len(tokenized["input_ids"]) == 0:
+        # TODO add ability to use another data set than the preprocessed one of Voskarides
+        # word_list, label_list = self.relevant_terms(history=tokenized_text,
+        #                                             gold_source=dictionary['answer_text_with_window'])
+        word_list = dictionary['bert_ner_overlap'][0]
+        label_list = dictionary['bert_ner_overlap'][1]
+
+        if len(word_list) != len(dictionary['bert_ner_overlap'][0]): # TODO remove for final commit
+            raise ValueError(f"The word list is parsed differently than Voskarides: {word_list}")
+
+        if label_list != dictionary['bert_ner_overlap'][1]: # TODO remove for final commit
+            raise ValueError(f"Label list is constructed differently than Voskarides: {word_list}")
+
+        tokenized = self._quretec_tokenize_with_metadata(words_list=word_list, labellist=label_list)
+
+        if len(tokenized["tokens"]) == 0:
             logger.warning(f"The following text could not be tokenized, likely because it contains a character that the tokenizer does not recognize: {tokenized_text}")
 
-        # truncate tokens, offsets and start_of_word to max_seq_len that can be handled by the model.
-        # Source: https://github.com/deepset-ai/FARM/blob/master/tutorials/2_Build_a_processor_for_your_own_dataset.ipynb
-        for seq_name in tokenized.keys():
-            tokenized[seq_name], _, _ = truncate_sequences(seq_a=tokenized[seq_name],
-                                                           seq_b=None,
-                                                           tokenizer=self.tokenizer,
-                                                           max_seq_len=self.max_seq_len,
-                                                           truncation_strategy='longest_first',
-                                                           with_special_tokens=False,  # False, because it already contains special tokens
-                                                           stride=0)
+        return [
+            Sample(id=f"{dictionary['id']}",
+                   clear_text={
+                       CanardProcessor.label_name_key: question,
+                       'tokenized_text': tokenized_text,
+                       CanardProcessor.gold_terms: gold_terms,
+                   },
+                   tokenized=tokenized)
+        ]
 
-        samples.append(Sample(id=f"{dictionary['id']}",
-                              clear_text={
-                                  CanardProcessor.label_name_key: question,
-                                  'tokenized_text': tokenized_text,
-                                  CanardProcessor.gold_terms: gold_terms,
-                              },
-                              tokenized=tokenized)
-                       )
-        return samples
+    def _quretec_tokenize_with_metadata(self, words_list: List[str], labellist: List[str]):
+        """
+        :param: text
+            The entire text without a initial [CLS] and closing [SEP] token. E.g. "Who are you? [SEP] I am your father"
+        """
+        tokens, labels, valid, label_mask = [], [], [], []
+
+        if len(words_list) != len(labellist):
+            raise ValueError(f"The word list (n={len(words_list)}) should be just as long as label list (n={len(labellist)})")
+
+        for i, word in enumerate(words_list):
+            token = self.tokenizer.tokenize(word)
+            tokens.extend(token)
+            label_1 = labellist[i]
+            for m in range(len(token)):
+                if m == 0:
+                    labels.append(label_1)
+                    valid.append(1)
+                    label_mask.append(1)
+                else:
+                    valid.append(0)
+
+        # truncate lists to match short sequence
+        if len(tokens) >= self.max_seq_len - 1:
+            # Minus two, because CLS will be prepended and a SEP token will be appended
+            tokens = tokens[0:(self.max_seq_len - 2)]
+            labels = labels[0:(self.max_seq_len - 2)]
+            valid = valid[0:(self.max_seq_len - 2)]
+            label_mask = label_mask[0:(self.max_seq_len - 2)]
+
+        return {
+            "tokens": tokens,
+            "labels": labels,
+            "label_mask": label_mask,
+            'valid': valid,
+        }
 
     def _sample_to_features(self, sample: Sample) -> List[dict]:
         """
         convert Sample into features for a PyTorch model
         """
-        return qurectec_sample_to_features_text(
-            sample=sample,
-            max_seq_len=self.max_seq_len,
-            tokenizer=self.tokenizer,
-            include_current_turn_in_target=self._include_current_turn_in_target
-        )
+
+        label_mask = sample.tokenized['label_mask']
+        labels = sample.tokenized['labels']
+        tokens = sample.tokenized['tokens']
+        valid = sample.tokenized['valid']
+
+        cls_token = self.tokenizer.cls_token
+        sep_token = self.tokenizer.sep_token
+
+        # Prepend CLS token to the start
+        segment_ids = [0]
+        label_ids = [self.label_to_id[cls_token]]
+        ntokens = [cls_token]
+
+        valid.insert(0, 1)
+        label_mask.insert(0, 1)
+
+
+        for i, token in enumerate(tokens):
+            ntokens.append(token)
+            segment_ids.append(0)
+            if len(labels) > i:
+                label_ids.append(self.label_to_id[labels[i]])
+        ntokens.append(sep_token)
+        segment_ids.append(0)
+        valid.append(1)
+        label_mask.append(1)
+        label_ids.append(self.label_to_id[sep_token])
+        input_ids = self.tokenizer.convert_tokens_to_ids(ntokens)
+
+        input_mask = [1] * len(input_ids)
+
+        # mask out labels for current turn.
+        cur_turn_index = label_ids.index(self.label_to_id[sep_token])
+
+        label_mask = [1] * cur_turn_index + [0] * (len(label_ids) - cur_turn_index)
+        label_mask[0] = 0  # mask
+
+        # Pad the features
+        while len(input_ids) < self.max_seq_len:
+            input_ids.append(self.tokenizer.pad_token_id)
+            input_mask.append(0)
+            segment_ids.append(0)
+            label_ids.append(0)
+            valid.append(1)
+            label_mask.append(0)
+
+        assert len(label_ids) == len(label_mask), f"label_ids has a different length than label_mask. label_ids={label_ids}, label_mask={label_mask}"
+        while len(label_ids) < self.max_seq_len:
+            label_ids.append(0)
+            label_mask.append(0)
+
+        assert len(input_ids) == self.max_seq_len
+        assert len(input_mask) == self.max_seq_len
+        assert len(segment_ids) == self.max_seq_len
+        assert len(label_ids) == self.max_seq_len
+        assert len(valid) == self.max_seq_len
+        assert len(label_mask) == self.max_seq_len
+
+        return [{
+            "input_ids": input_ids,
+            "input_mask": input_mask,
+            "segment_ids": segment_ids,
+            "label_ids": label_ids,
+            "valid_ids": valid,
+            "label_mask": label_mask,
+        }]
 

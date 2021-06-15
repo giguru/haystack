@@ -1,25 +1,25 @@
 import json
 import re
-from pathlib import Path
-from typing import List
 import torch
 import logging
 import numpy as np
-from farm.data_handler.utils import is_json
-from tqdm import tqdm
 import time
-from torch import nn
 import datetime
+from pathlib import Path
+from typing import List
+
+from farm.train import Trainer
+from tqdm import tqdm
+from torch import nn
 from farm.modeling.tokenization import Tokenizer
-from transformers import AutoModel
+from transformers import BertForTokenClassification, BertConfig
 from farm.modeling.optimization import initialize_optimizer
 from farm.data_handler.data_silo import DataSilo
 from haystack import BaseComponent
 from haystack.eval import EvalQueryResolution
-from haystack.query_rewriting.data_handler import get_full_word
-import spacy
 
 logger = logging.getLogger(__name__)
+
 
 def dict_to_string(d: dict):
     regex = '#(\W|\.)+#'
@@ -29,49 +29,60 @@ def dict_to_string(d: dict):
     return "_".join(params_strings)
 
 
-class QueryResolutionModel(nn.Module):
+class QueryResolutionModel(BertForTokenClassification):
     model_binary_file_name = "query_resolution"
 
-    def __init__(self,
-                 model_name_or_path: str,
-                 linear_layer_size=1024,
-                 output_size=512,
-                 dropout_prob=0.0,
-                 ):
-        """
-        :param linear_layer_size
-            1024 is suitable for the bert-large-uncased model from HuggingFace Transformers library
-        :param output_size
-        """
-        super(QueryResolutionModel, self).__init__()
-        self.dropout_prob = dropout_prob
-        self._linear_layer_size = linear_layer_size
-        self.output_size = output_size
+    def __init__(self, config: BertConfig, bert_model: str, max_seq_len: int, device):
+        super(QueryResolutionModel, self).__init__(config)
+        self.bert_model = bert_model
+        self.max_seq_len = max_seq_len
+        self.config = config
+        self._device = device
+        logger.info(f"QueryResolution model {config}")
 
-        self._bert = AutoModel.from_pretrained(model_name_or_path, hidden_dropout_prob=dropout_prob)
-        self._dropout = nn.Dropout(p=dropout_prob)
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, valid_ids=None,
+                attention_mask_label=None):
+        sequence_output = self.bert(input_ids, token_type_ids, attention_mask, head_mask=None)[0]
+        valid_output = self.transfer_valid_output(sequence_output=sequence_output, valid_ids=valid_ids)
+        sequence_output = self.dropout(valid_output).to(self._device)
+        logits = self.classifier(sequence_output).to(self._device)
 
-        self._linear1 = nn.Linear(self._linear_layer_size, output_size)
-        logger.info(f"Initiating QueryResolution model with dropout_prod={dropout_prob}")
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss(ignore_index=0)
+            # Only keep active parts of the loss
+            # attention_mask_label = None
+            if attention_mask_label is not None:
+                active_logits = self.apply_label_attention_mask_classifier_output(attention_mask_label, logits)
+                active_labels = self.apply_attention_mask(attention_mask_label, labels)
+                loss = loss_fct(active_logits, active_labels)
+            else:
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            return loss, logits
+        else:
+            return logits
 
-    def forward(self, **kwargs):
-        """
-        Watch out! Since the output of this model should be a classification token for each term
-        (0 for unrelevant tokens and 1 for relevant tokens). Please make sure you apply the sigmoid function
-        on the output of this method to make sure value is between zero and 1.
-        This is done, because the QueryResolution pipeline component use a torch.nn.BCELogitsWithLoss which uses
-        a sigmoid internally instead of a torch.nn.BCELoss.
-        """
-        bert_output = self._bert(**kwargs)
-        sequence_output = bert_output.last_hidden_state
+    def transfer_valid_output(self, sequence_output, valid_ids):
+        batch_size, max_len, feat_dim = sequence_output.shape
+        valid_output = torch.zeros(batch_size, max_len, feat_dim, dtype=torch.float32)
+        for i in range(batch_size):
+            jj = -1
+            for j in range(max_len):
+                if valid_ids[i][j].item() == 1:
+                    jj += 1
+                    valid_output[i][jj] = sequence_output[i][j]
+        return valid_output
 
-        # sequence_output has the following shape: (batch_size, sequence_length, output_size)
-        # extract the 1st token's embeddings
-        dropout_output = self._dropout(sequence_output[:, 0, :].view(-1, self._linear_layer_size))
-        linear1_output = self._linear1(dropout_output)
-        return linear1_output
+    def apply_label_attention_mask_classifier_output(self, attention_mask_label, logits):
+        active_loss = attention_mask_label.view(-1) == 1
+        active_logits = logits.view(-1, self.num_labels)[active_loss]
+        return active_logits
 
-    def save(self, save_dir):
+    def apply_attention_mask(self, attention_mask_label, input):
+        active_loss = attention_mask_label.view(-1) == 1
+        return input.view(-1)[active_loss]
+
+
+    def save(self, save_dir: str, id_to_label: dict):
         """
         Save the model state_dict and its config file so that it can be loaded again.
         :param save_dir: The directory in which the model should be saved.
@@ -79,78 +90,146 @@ class QueryResolutionModel(nn.Module):
         """
         Path(save_dir).mkdir(exist_ok=True, parents=True)
         logger.info("Saving model to folder: "+str(save_dir))
-        torch.save(self.state_dict(), f=Path(save_dir) / 'pytorch_model.bin')
-        self._save_config(save_dir)
+        model_to_save = self.module if hasattr(self, 'module') else self  # Only save the model it-self
+        model_to_save.save_pretrained(Path(save_dir))
+        self._save_config(save_dir, id_to_label=id_to_label)
 
-    def _save_config(self, save_dir: str):
+    def _save_config(self, save_dir: str, id_to_label: dict):
         """
         Saves the config as a json file.
         :param save_dir: Path to save config to
         """
+        model_config = self.config.to_dict()
+        model_config['bert_model'] = self.bert_model
+        model_config['max_seq_len'] = self.max_seq_len
+        model_config['id2label'] = id_to_label
         output_config_file = Path(save_dir) / f"config.json"
         with open(output_config_file, "w") as file:
-            json.dump(self._generate_config(), file)
+            json.dump(model_config, file)
 
-    def _generate_config(self):
-        """
-        Generates config file from Class parameters (only for sensible config parameters).
-        """
-        config = self._bert.config.to_dict()
-        for key, value in self.__dict__.items():
-            if type(value) is np.ndarray:
-                value = value.tolist()
-            if is_json(value) and key[0] != "_":
-                config[key] = value
-        config["name"] = self.__class__.__name__
-        config.pop("config", None)
-        return config
 
+def end_of_chunk(prev_tag, tag, prev_type, type_):
+    """Checks if a chunk ended between the previous and current word.
+
+    Args:
+        prev_tag: previous chunk tag.
+        tag: current chunk tag.
+        prev_type: previous type.
+        type_: current type.
+
+    Returns:
+        chunk_end: boolean.
+    """
+    chunk_end = False
+
+    if prev_tag == 'E': chunk_end = True
+    if prev_tag == 'S': chunk_end = True
+
+    if prev_tag == 'B' and tag == 'B': chunk_end = True
+    if prev_tag == 'B' and tag == 'S': chunk_end = True
+    if prev_tag == 'B' and tag == 'O': chunk_end = True
+    if prev_tag == 'I' and tag == 'B': chunk_end = True
+    if prev_tag == 'I' and tag == 'S': chunk_end = True
+    if prev_tag == 'I' and tag == 'O': chunk_end = True
+
+    if prev_tag != 'O' and prev_tag != '.' and prev_type != type_:
+        chunk_end = True
+
+    return chunk_end
+
+
+def start_of_chunk(prev_tag, tag, prev_type, type_):
+    """Checks if a chunk started between the previous and current word.
+
+    Args:
+        prev_tag: previous chunk tag.
+        tag: current chunk tag.
+        prev_type: previous type.
+        type_: current type.
+
+    Returns:
+        chunk_start: boolean.
+    """
+    chunk_start = False
+
+    if tag == 'B': chunk_start = True
+    if tag == 'S': chunk_start = True
+
+    if prev_tag == 'E' and tag == 'E': chunk_start = True
+    if prev_tag == 'E' and tag == 'I': chunk_start = True
+    if prev_tag == 'S' and tag == 'E': chunk_start = True
+    if prev_tag == 'S' and tag == 'I': chunk_start = True
+    if prev_tag == 'O' and tag == 'E': chunk_start = True
+    if prev_tag == 'O' and tag == 'I': chunk_start = True
+
+    if tag != 'O' and tag != '.' and prev_type != type_:
+        chunk_start = True
+
+    return chunk_start
+
+
+def get_entities(seq):
+    """Gets entities from sequence.
+
+    Args:
+        seq (list): sequence of labels.
+
+    Returns:
+        list: list of (chunk_type, index).
+
+    Example:
+        >>> from seqeval.metrics.sequence_labeling import get_entities
+        >>> seq = ['REL', 'REL', 'O', '[SEP]']
+        >>> get_entities(seq)
+        [('REL', 0), ('REL', 1), ('SEP', 3)]
+    """
+    # for nested list
+    if any(isinstance(s, list) for s in seq):
+        seq = [item for sublist in seq for item in sublist + ['O']]
+    return [(label, i) for i, label in enumerate(seq) if label != 'O']
 
 class QueryResolution(BaseComponent):
     def __init__(self,
-                 model_name_or_path: str = "bert-large-uncased",
+                 config,
+                 bert_model: str = 'bert-large-uncased',
                  use_gpu: bool = True,
                  progress_bar: bool = True,
                  tokenizer_args: dict = {},
                  model_args: dict = {},
-                 space_lang="en_core_web_sm"
         ):
         """
         Query resolution for Session based pipeline runs. This component is based on the paper:
         Query Resolution for Conversational Search with Limited Supervision
         """
         # Directly store some arguments as instance properties
-        self.model_name_or_path = model_name_or_path
         self.use_gpu = use_gpu
         self.progress_bar = progress_bar
         self.sigmoid = nn.Sigmoid()
 
         # Set derived instance properties
-        self.tokenizer = Tokenizer.load(model_name_or_path, **tokenizer_args)
-        self.model = QueryResolutionModel(model_name_or_path=model_name_or_path, **model_args)
-
+        self.tokenizer = Tokenizer.load(bert_model, **tokenizer_args)
         if use_gpu and torch.cuda.is_available():
-            logger.info("Using GPU Cuda")
-            self.device = torch.device("cuda")
+            device = 'cuda'
         else:
-            logger.info("Using CPU")
-            self.device = torch.device("cpu")
+            device = 'cpu'
+        logger.info(f"Using {device}")
+        self.model = QueryResolutionModel(config=config, device=device, **model_args)
+        self.device = torch.device(device)
 
-        self.nlp = spacy.load(space_lang)
 
     def train(self,
               processor,
               eval_metrics: EvalQueryResolution,
               eval_data_set: str,
-              learning_rate: float = 3e-6,
+              learning_rate: float = 5e-5,
               batch_size: int = 2,
               gradient_clipping: float = 1.0,
               n_gpu: int = 1,
               optimizer_name: str = 'AdamW',
               evaluate_every: int = 200,
               print_every: int = 200,
-              epsilon: float = 1e-08,  # TODO QuReTec does not mention epsilon
-              n_epochs: int = 1,
+              epsilon: float = 1e-8,
+              n_epochs: int = 3,
               save_dir: str = "saved_models",
               disable_tqdm: bool = False,
               grad_acc_steps: int = 2,
@@ -158,8 +237,11 @@ class QueryResolution(BaseComponent):
               datasilo_args: dict = None,
               num_warmup_steps: int = 200,
               early_stopping: int = None,
-              checkpoint_every: int = None,
               ):
+        """
+        :param: n_epochs
+            Voskarides et al. use 3 epochs
+        """
         logger.info(f'Training QueryResolution with batch_size={batch_size}, gradient_clipping={gradient_clipping}, '
                     f'epsilon={epsilon}, n_gpu={n_gpu}, grad_acc_steps={grad_acc_steps}, evaluate_every={evaluate_every}, '
                     f'print_every={print_every}, early_stopping={early_stopping}')
@@ -167,9 +249,6 @@ class QueryResolution(BaseComponent):
             datasilo_args = {
                 "caching": False,
             }
-
-        if checkpoint_every is None and evaluate_every:
-            checkpoint_every = evaluate_every
 
         self.data_silo = DataSilo(processor=processor,
                                   batch_size=batch_size,
@@ -200,17 +279,29 @@ class QueryResolution(BaseComponent):
             'learning_rate': learning_rate,
             'eps': epsilon,
             'weight_decay': weight_decay,
-            'dropout': self.model.dropout_prob
+            'hidden_dropout_prob': self.model.config.hidden_dropout_prob
         }
         model_save_dir = Path(save_dir) / ("query_resolution_" + dict_to_string(params_dict))
 
         # Set in training mode
         self.model.train()
 
-        loss_fn = nn.BCEWithLogitsLoss(reduction="none")
         loss = 0
         total_loss = 0
 
+        trainer = Trainer(
+            model=self.model,
+            optimizer=optimizer,
+            data_silo=self.data_silo,
+            epochs=n_epochs,
+            n_gpu=n_gpu,
+            lr_schedule=lr_schedule,
+            evaluate_every=evaluate_every,
+            device=self.device,
+        )
+        trainer.train()
+        """
+        # TODO use trainer
         for epoch in range(n_epochs):
             t0 = time.time()
             train_data_loader = self.data_silo.get_data_loader("train")
@@ -224,74 +315,99 @@ class QueryResolution(BaseComponent):
 
                 # Move batch of samples to device
                 batch = {key: batch[key].to(self.device) for key in batch}
-
-                # Always clear previous gradients before performing backward pass. PyTorch doesn't do this automatically
-                # accumulating the gradients is "convenient while training RNNs"
-                # (source: https://stackoverflow.com/questions/48001598/why-do-we-need-to-call-zero-grad-in-pytorch)
-                self.model.zero_grad()
-                outputs = self.model(input_ids=batch['input_ids'],
-                                     attention_mask=batch['attention_mask'],
-                                     token_type_ids=batch['token_type_ids'])
-                target = batch['target'].float()
-
-                # Voskarides et al. mention "We mask out the output of <CLS> and the current turn terms, since we are
-                # not interested in predicting a label for those", so only compute loss for tokens you need to predict
-                # a label for
-                loss_tensors = loss_fn(outputs, target)
-                loss = torch.mean(loss_tensors * batch['start_of_words'])
-                total_loss += loss
+                loss, logits = self.model(input_ids=batch['input_ids'],
+                                          token_type_ids=batch['segment_ids'],
+                                          attention_mask=batch['input_mask'],
+                                          labels=batch['label_ids'],
+                                          valid_ids=batch['valid_ids'],
+                                          attention_mask_label=batch['label_mask'])
+                loss = loss.mean()
                 loss.backward()
+                loss_val = loss.item()
+                total_loss += loss_val
 
-                if print_every and step % print_every == 0:
-                    # Show an example of the results
-                    output_tensor = self.sigmoid(outputs.detach()).detach()[0].float()
-                    input_id_tensor = batch['input_ids'][0]
-                    target_tensor = target[0]
-                    attention_tensor = batch['attention_mask'][0].tolist()
-                    self._print_classifier_result(input_token_ids=input_id_tensor,
-                                                  attention_mask=attention_tensor,
-                                                  target_tensor=target_tensor,
-                                                  output_tensor=output_tensor,
-                                                  verbose=True)
-                    predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(
-                        input_ids=input_id_tensor.tolist(),
-                        predicted_tensor=output_tensor.round().tolist(),
-                        target_tensor=target_tensor.tolist(),
-                    )
-                    logger.info(f"The items used for metrics are: \n"
-                                f"Predicted words: {predicted_tokens}\n"
-                                f"Gold tokens: {gold_tokens}")
                 # Prevent exploding gradients
-                if hasattr(optimizer, "clip_grad_norm"):
-                    # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                    optimizer.clip_grad_norm(gradient_clipping)
-                else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), gradient_clipping)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), gradient_clipping)
 
                 optimizer.step()  # Update model parameters
                 optimizer.zero_grad()  # TODO is this necessary when using model.zero_grad()?
                 lr_schedule.step()  # Update the learning rate
+                # Always clear previous gradients before performing backward pass. PyTorch doesn't do this automatically
+                # accumulating the gradients is "convenient while training RNNs"
+                # (source: https://stackoverflow.com/questions/48001598/why-do-we-need-to-call-zero-grad-in-pytorch)
+                self.model.zero_grad()
+                label_list = processor.get_labels()
+                if print_every and step % print_every == 0:
+                    predicted_tokens, gold_tokens = self._get_results(batch=batch, logits=logits, label_list=label_list)
+                    logger.info(f"The items used for metrics are: \n"
+                                f"Predicted words: {predicted_tokens}\n"
+                                f"Gold tokens: {gold_tokens}")
 
                 if evaluate_every and step % evaluate_every == 0:
                     logger.info(f"Evaluating at step {step}")
-                    self.eval(data_loader=self.data_silo.get_data_loader(eval_data_set), metrics=eval_metrics)
+                    self.eval(data_loader=self.data_silo.get_data_loader(eval_data_set),
+                              metrics=eval_metrics,
+                              label_list=label_list)
 
                     # Eval sets the model in eval mode, so set it to training mode again
                     self.model.train()
 
-                    if eval_metrics.has_no_improvement():
-                        break
+                    if eval_metrics.last_recorded_is_the_highest_metric():
+                        checkpoint_model_save_dir = str(model_save_dir) + ".ckpt-" + str(step)
+                        self.model.save(checkpoint_model_save_dir, id_to_label=processor.id_to_label)
+                        self.tokenizer.save_pretrained(save_directory=checkpoint_model_save_dir)
 
                 if early_stopping and step >= early_stopping:
                     break
-
-                if checkpoint_every and step % checkpoint_every == 0:
-                    checkpoint_model_save_dir = str(model_save_dir) + ".ckpt-" + str(step)
-                    self.model.save(checkpoint_model_save_dir)
-                    self.tokenizer.save_pretrained(save_directory=checkpoint_model_save_dir)
-
-        self.model.save(model_save_dir)
+        """
+        # TODO save the best performing model
+        self.model.save(model_save_dir, id_to_label=processor.id_to_label)
         self.tokenizer.save_pretrained(save_directory=str(model_save_dir))
+
+    def _get_results(self, batch, logits, label_list):
+        """
+        :param: logits
+            Two dimensional logits. N x M where N is the number of samples in a batch and M is the tensor length of one
+            sample.
+        """
+        logits = torch.argmax(nn.functional.log_softmax(logits, dim=2), dim=2)
+        logits = logits.detach().cpu().numpy()
+
+        label_map = {i: label for i, label in enumerate(label_list, 1)}
+        label_to_id_map = {label: i for i, label in enumerate(label_list, 1)}
+        y_true, y_pred, terms = [], [], []
+        label_ids = batch['label_ids'].to('cpu').numpy()
+        input_ids = batch['input_ids'].to('cpu').numpy()
+        valid_ids = batch['valid_ids'].to('cpu').numpy()
+        for i, label in enumerate(label_ids):
+            temp_1, temp_2, temp_3 = [], [], []
+
+            for j, m in enumerate(label):
+                if j == 0:  # skip initial CLS
+                    continue
+                elif label_ids[i][j] == label_to_id_map['[SEP]']:  # break at the first [SEP] token
+                    y_true.append(temp_1)
+                    y_pred.append(temp_2)
+                    tmp = self.tokenizer.convert_ids_to_tokens(input_ids[i])
+                    x_input_tokens = []
+                    for jj in range(1, len(tmp)):  # skip initial CLS
+                        token = tmp[jj]
+                        if token == '[PAD]':
+                            break
+                        if valid_ids[i][jj] == 1:
+                            x_input_tokens.append(token)
+                        else:
+                            x_input_tokens[-1] += token
+
+                    # remove bert tokenization chars ## from tokens
+                    terms.append([s.replace('##', '') for s in x_input_tokens])
+                    break
+                else:
+                    temp_1.append(label_map[label_ids[i][j]])
+                    temp_2.append(label_map.get(logits[i][j], 'O'))
+                    temp_3.append(input_ids[i][j])
+
+        return y_pred, y_true
 
     def _print_classifier_result(self,
                                  input_token_ids: torch.Tensor,
@@ -320,93 +436,30 @@ class QueryResolution(BaseComponent):
                         f'and target     {str(relevant_tokens["target"])}\n'
                         f'the result is: {str(relevant_tokens["output"])}')
 
-    def dataset_statistics(self,
-                 processor,
-                 metrics: EvalQueryResolution,
-                 data_sets: List[str],
-                 batch_size: int = 100,
-                 disable_tqdm: bool = False,
-                 debug: bool = True):
+    def _get_predicted_and_gold_tokens(self, terms: List, predicted_labels: List, gold_labels: List):
         """
-        Be able to reproduce the baselines from the published paper.
-        In addition, it computes the Original (all) of Table 4: Query resolution datasets statistics.
+        Args:
+            gold_labels : 2d array. Ground truth (correct) target values.
+            predicted_labels : 2d array. Estimated targets as returned by a tagger.
         """
-        self.model.eval()
-        data_silo = DataSilo(processor=processor,
-                             batch_size=batch_size,
-                             distributed=False,
-                             max_processes=1,
-                             caching=False,
-                             automatic_loading=True)
+        # Paper says: "We apply lowercase, lemmatization and stopword removal to qi∗,
+        # q1:i−1 and qi using Spacy12 before calculating term overlap in Equation 2.", so
+        # lemmatise the full word and remove non-stopwords.
+        true_entities = set(get_entities(gold_labels))
+        pred_entities = set(get_entities(predicted_labels))
 
-        for data_set in data_sets:
-            data_loader = data_silo.get_data_loader(data_set)
+        try:
+            predicted_terms = [terms[tup[1]] for tup in pred_entities]
+            gold_terms = [terms[tup[1]] for tup in true_entities]
+            return predicted_terms, gold_terms
+        except IndexError as e:
+            print(f"{e} with terms={terms} \nand true_entities={true_entities} \nand pred_entities={pred_entities}")
+            raise e
 
-            input_lengths = []
-            number_of_positive_terms = []
-            with torch.no_grad():
-                progress_bar = tqdm(data_loader, disable=disable_tqdm)
-                progress_bar.set_description(f"Computing dataset statistics of the '{data_set}' data set")
-
-                for step, batch in enumerate(progress_bar):
-                    for i in range(0, len(batch['input_ids'])):
-                        target_tensor = batch['target'][i]
-                        input_ids_tensor = batch['input_ids'][i]
-                        attention_tensor = batch['attention_mask'][i]
-                        # Provide start of words to simulate Original (all) from Table 5 in original paper
-                        predicted_tensor = batch['start_of_words'][i]
-
-                        predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=input_ids_tensor.tolist(),
-                                                                                            predicted_tensor=predicted_tensor.tolist(),
-                                                                                            target_tensor=target_tensor.tolist()
-                                                                                            )
-                        metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
-
-                        input_lengths.append(list(batch['start_of_words'][i]).count(1))
-                        number_of_positive_terms.append(list(batch['target'][i]).count(1))
-
-                        if debug and step == 0 and i == 0:
-                            self._print_classifier_result(input_token_ids=input_ids_tensor,
-                                                          target_tensor=target_tensor,
-                                                          output_tensor=predicted_tensor,
-                                                          attention_mask=attention_tensor,
-                                                          verbose=True)
-                            logger.info(f"The items used for metrics are: \n"
-                                        f"Predicted words: {predicted_tokens}\n"
-                                        f"Gold tokens: {gold_tokens}")
-
-            print('\n')  # End the line printed by the progress_bar
-            logger.info(f"Statistics of the '{data_set}' data set. \n"
-                        f"Total queries:  {len(input_lengths)}\n"
-                        f"Total terms:    {np.mean(input_lengths):.2f} +- {np.std(input_lengths):.2f}\n"
-                        f"Positive terms: {np.mean(number_of_positive_terms):.2f} +- {np.std(number_of_positive_terms):.2f}")
-            metrics.print(mode="query_resolution", use_logged_values=False)
-            metrics.init_counts()
-
-    def _get_predicted_and_gold_tokens(self, input_ids, predicted_tensor, target_tensor):
-        predicted_terms = []
-        gold_terms = []
-        for idx, token_id in enumerate(input_ids):
-            if predicted_tensor[idx] == 1.0 or target_tensor[idx] == 1.0:
-                # Paper says: "We apply lowercase, lemmatization and stopword removal to qi∗,
-                # q1:i−1 and qi using Spacy12 before calculating term overlap in Equation 2.", so
-                # lemmatise the full word and remove non-stopwords
-                full_word, _, _, parsed = get_full_word(tokenizer=self.tokenizer,
-                                                        input_ids=input_ids,
-                                                        pos=idx,
-                                                        parse=True)
-
-                # Check if the non-lemmatised full word is in stop words, since the Spacy stopwords set
-                # does not contain lemmatised words.
-                if parsed.is_stop is False and parsed.is_punct is False:
-                    if predicted_tensor[idx] == 1.0:
-                        predicted_terms.append(parsed.lemma_)
-                    if target_tensor[idx] == 1.0:
-                        gold_terms.append(parsed.lemma_)
-        return predicted_terms, gold_terms
 
     def eval(self,
              data_loader,
+             label_list,
              metrics: EvalQueryResolution,
              disable_tqdm: bool = False):
         self.model.to(self.device)
@@ -414,27 +467,24 @@ class QueryResolution(BaseComponent):
 
         t0 = time.time()
 
-        with torch.no_grad():
-            progress_bar = tqdm(data_loader, disable=disable_tqdm)
+        progress_bar = tqdm(data_loader, disable=disable_tqdm)
 
-            for step, batch in enumerate(progress_bar):
-                # Calculate elapsed time in minutes.
-                elapsed = datetime.timedelta(seconds=int(round(time.time() - t0)))
-                progress_bar.set_description(f"Evaluating in progress. Elapsed: {elapsed}")
+        for step, batch in enumerate(progress_bar):
+            # Calculate elapsed time in minutes.
+            elapsed = datetime.timedelta(seconds=int(round(time.time() - t0)))
+            progress_bar.set_description(f"Evaluating in progress. Elapsed: {elapsed}")
 
-                # Move batch of samples to device
-                batch = {key: batch[key].to(self.device) for key in batch}
-                outputs = self.model(input_ids=batch['input_ids'],
-                                     attention_mask=batch['attention_mask'],
-                                     token_type_ids=batch['token_type_ids']
-                                     )
-                sigmoid_outputs = self.sigmoid(outputs).detach()
-                for i in range(0, len(batch['input_ids'])):
-                    predicted_tokens, gold_tokens = self._get_predicted_and_gold_tokens(input_ids=batch['input_ids'][i].tolist(),
-                                                                                        predicted_tensor=sigmoid_outputs[i].float().round().tolist(),
-                                                                                        target_tensor=batch['target'][i].tolist(),
-                                                                                        )
-                    metrics.run(predicted_tokens=predicted_tokens, gold_tokens=gold_tokens)
+            # Move batch of samples to device
+            batch = {key: batch[key].to(self.device) for key in batch}
+            with torch.no_grad():
+                logits = self.model(input_ids=batch['input_ids'],
+                                    token_type_ids=batch['segment_ids'],
+                                    attention_mask=batch['input_mask'],
+                                    valid_ids=batch['valid_ids'],
+                                    attention_mask_label=batch['label_mask'])
+            predicted_tokens, gold_tokens = self._get_results(batch=batch, logits=logits, label_list=label_list)
+            for i in range(len(predicted_tokens)):
+                metrics.run(predicted_tokens=predicted_tokens[i], gold_tokens=gold_tokens[i])
         progress_bar.close()
         logger.info("Printing metrics")
         metrics.print(mode="query_resolution", use_logged_values=False)

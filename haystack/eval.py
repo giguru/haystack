@@ -1,10 +1,13 @@
 from typing import List, Tuple, Dict, Any
 import logging
+import numpy as np
 
 from haystack import MultiLabel
 
 from farm.evaluation.squad_evaluation import compute_f1 as calculate_f1_str
 from farm.evaluation.squad_evaluation import compute_exact as calculate_em_str
+
+from haystack.query_rewriting.query_resolution import get_entities
 
 logger = logging.getLogger(__name__)
 
@@ -249,45 +252,31 @@ class EvalQueryResolution:
 
     def init_counts(self):
         logger.info("Metrics are reset")
-        self.true_pos = 0.0
-        self.false_pos = 0.0
-        self.false_neg = 0.0
+        self.correct = 0.0
+        self.pred = 0.0
+        self.true = 0.0
 
-    def run(self, predicted_tokens, gold_tokens):
-        """Run this node on one sample and its labels"""
-        predicted_count = {i: predicted_tokens.count(i) if self.use_counts else 1 for i in predicted_tokens}
-        gold_count = {i: gold_tokens.count(i) if self.use_counts else 1 for i in gold_tokens}
-        fp, tp, fn = 0, 0, 0
+    def run(self, predicted_tokens: List, gold_tokens: List):
+        """Run this node on ONE sample and its labels"""
 
-        for i in predicted_count:
-            if i not in gold_count:
-                fp += predicted_count[i]
-            elif predicted_count[i] >= gold_count[i]:
-                tp += gold_count[i]
-                fp += predicted_count[i] - gold_count[i]
-            elif predicted_count[i] < gold_count[i]:
-                tp += predicted_count[i]
-                fn += gold_count[i] - predicted_count[i]
-        # Some id might have never been predicted
-        for i in gold_count:
-            if i not in predicted_count:
-                fn += gold_count[i]
+        true_entities = set(get_entities(gold_tokens))
+        pred_entities = set(get_entities(predicted_tokens))
 
-        self.true_pos += tp
-        self.false_pos += fp
-        self.false_neg += fn
+        self.correct += len(true_entities & pred_entities)
+        self.pred += len(pred_entities)
+        self.true += len(true_entities)
 
     def calc_metric(self):
         logger.info(f"Calculating metrics in {self.__class__.__name__} with "
-                    f"tp={self.true_pos}, fp={self.false_pos}, fn={self.false_neg}")
+                    f"correct={self.correct}, pred={self.pred}, true={self.true}")
 
-        micro_recall = self.true_pos / (self.true_pos + self.false_neg)
-        if self.true_pos + self.false_pos == 0:
-            micro_precision = 0
+        micro_precision = self.correct / self.pred if self.pred > 0 else 0
+        micro_recall = self.correct / self.true if self.true > 0 else 0
+
+        if micro_precision + micro_recall == 0:
+            micro_f1 = 0
         else:
-            micro_precision = self.true_pos / (self.true_pos + self.false_pos)
-
-        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
+            micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
         return {
             EvalQueryResolution.micro_recall_key: micro_recall * 100,
             EvalQueryResolution.micro_precision_key: micro_precision * 100,
@@ -322,10 +311,9 @@ class EvalQueryResolution:
                     f"Micro precision: {micro_precision:.4f} ({micro_precision_diff:.4f})\n"
                     f"Micro F1       : {micro_f1:.4f} ({micro_f1_diff:.4f})")
 
-    def has_no_improvement(self):
+    def last_recorded_is_the_highest_metric(self):
         data = self.log[EvalQueryResolution.micro_f1_key]
-        # If the F1 score decreases 3 times in row, there is no improvement.
-        return len(data) >= 3 and data[-1] < data[-2] < data[-3]
+        return data.index(max(data)) == len(data) - 1
 
 
 def calculate_em_str_multi(gold_labels, prediction):
