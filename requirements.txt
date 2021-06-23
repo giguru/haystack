@@ -16,8 +16,9 @@ python-multipart
 python-docx
 sqlalchemy>=1.4.2
 sqlalchemy_utils
+torch==1.8.1+cu111
 # for using FAISS with GPUs, install faiss-gpu
-faiss-cpu>=1.6.3
+faiss-gpu>=1.6.3
 tika
 uvloop==0.14; sys_platform != 'win32' and sys_platform != 'cygwin'
 httptools
@@ -33,3 +34,6 @@ pymilvus
 SPARQLWrapper
 spacy
 datasets
+
+# Optional: For Anserini Document Store
+pyserini==0.12.0

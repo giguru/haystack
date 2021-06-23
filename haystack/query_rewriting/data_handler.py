@@ -8,8 +8,7 @@ import spacy
 
 from farm.data_handler.processor import Processor
 from farm.data_handler.samples import Sample
-from farm.data_handler.utils import pad
-from farm.modeling.tokenization import truncate_sequences
+from farm.evaluation.metrics import register_metrics
 from spacy.tokens import Token
 from transformers import BertTokenizer
 from typing import List
@@ -19,6 +18,51 @@ logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
 
 cached_parsed_spacy_token = {}
+
+
+def get_entities(seq):
+    """Gets entities from sequence.
+
+    Args:
+        seq (list): sequence of labels.
+
+    Returns:
+        list: list of (chunk_type, index).
+
+    Example:
+        >>> seq = ['REL', 'REL', 'O', '[SEP]']
+        >>> get_entities(seq)
+        [('REL', 0), ('REL', 1), ('SEP', 3)]
+    """
+    # for nested list
+    if any(isinstance(s, list) for s in seq):
+        seq = [item for sublist in seq for item in sublist + ['O']]
+    return [(label, i) for i, label in enumerate(seq) if label != 'O']
+
+
+def f1_micro(preds, labels):
+    true_entities = set(get_entities(labels))
+    pred_entities = set(get_entities(preds))
+
+    correct = len(true_entities & pred_entities)
+    pred = len(pred_entities)
+    true = len(true_entities)
+
+    micro_precision = correct / pred if pred > 0 else 0
+    micro_recall = correct / true if true > 0 else 0
+
+    if micro_precision + micro_recall == 0:
+        micro_f1 = 0
+    else:
+        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
+    return {
+        'micro_recall': micro_recall * 100,
+        'micro_precision': micro_precision * 100,
+        'micro_f1': micro_f1 * 100
+    }
+
+
+register_metrics('f1_micro', f1_micro)
 
 
 def get_spacy_parsed_word(word: str) -> Token:
@@ -83,25 +127,35 @@ class CanardProcessor(Processor):
                                               test_filename=test_filename,
                                               data_dir=data_dir,
                                               dev_split=0,
-                                            )
-
+                                              )
         self.add_task(name="ner",
-                      metric="F1",
-                      label_name=CanardProcessor.label_name_key,
-                      task_type="classification",
-                      label_list=self.get_labels()
+                      metric="f1_micro",
+                      label_list=self.get_labels(),
+                      label_name="label"  # The label tensor name without "_ids" at the end
                       )
-        self.label_to_id = {label: i for i, label in enumerate(self.get_labels(), 1)}
-        self.id_to_label = {i: label for i, label in enumerate(self.get_labels(), 1)}
+        self.label_to_id = self.label2id()
+        self.id_to_label = self.id2label()
 
     @staticmethod
     def get_labels():
         return [
+            '[PAD]',
             CanardProcessor.labels['NOT_RELEVANT'],
             CanardProcessor.labels['RELEVANT'],
             "[CLS]",
             "[SEP]"
         ]
+
+    @staticmethod
+    def label2id():
+        return {label: i for i, label in enumerate(CanardProcessor.get_labels())}
+
+    @staticmethod
+    def id2label():
+        return {i: label for i, label in enumerate(CanardProcessor.get_labels())}
+
+    def pad_token_id():
+        return CanardProcessor.get_labels().index('[PAD]')
 
     def file_to_dicts(self, file: str) -> [dict]:
 
@@ -230,7 +284,6 @@ class CanardProcessor(Processor):
         valid.insert(0, 1)
         label_mask.insert(0, 1)
 
-
         for i, token in enumerate(tokens):
             ntokens.append(token)
             segment_ids.append(0)
@@ -249,7 +302,6 @@ class CanardProcessor(Processor):
         cur_turn_index = label_ids.index(self.label_to_id[sep_token])
 
         label_mask = [1] * cur_turn_index + [0] * (len(label_ids) - cur_turn_index)
-        label_mask[0] = 0  # mask
 
         # Pad the features
         while len(input_ids) < self.max_seq_len:
@@ -274,10 +326,10 @@ class CanardProcessor(Processor):
 
         return [{
             "input_ids": input_ids,
-            "input_mask": input_mask,
-            "segment_ids": segment_ids,
+            "attention_mask": input_mask,
+            "token_type_ids": segment_ids,
             "label_ids": label_ids,
             "valid_ids": valid,
-            "label_mask": label_mask,
+            "label_attention_mask": label_mask,
         }]
 

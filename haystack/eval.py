@@ -7,8 +7,6 @@ from haystack import MultiLabel
 from farm.evaluation.squad_evaluation import compute_f1 as calculate_f1_str
 from farm.evaluation.squad_evaluation import compute_exact as calculate_em_str
 
-from haystack.query_rewriting.query_resolution import get_entities
-
 logger = logging.getLogger(__name__)
 
 
@@ -230,90 +228,6 @@ class EvalReader:
                 print(
                     "(top k results are likely inflated since the Reader always returns a no_answer prediction in its top k)"
                 )
-
-
-class EvalQueryResolution:
-    micro_recall_key = 'micro_recall'
-    micro_precision_key = 'micro_precision'
-    micro_f1_key = 'micro_f1'
-
-    """
-    This is a pipeline node that should be placed after a QueryResolution module.
-    """
-
-    def __init__(self, use_counts: bool):
-        self.use_counts = use_counts
-        self.init_counts()
-        self.log = {
-            EvalQueryResolution.micro_recall_key: [0.],
-            EvalQueryResolution.micro_precision_key: [0.],
-            EvalQueryResolution.micro_f1_key: [0.],
-        }
-
-    def init_counts(self):
-        logger.info("Metrics are reset")
-        self.correct = 0.0
-        self.pred = 0.0
-        self.true = 0.0
-
-    def run(self, predicted_tokens: List, gold_tokens: List):
-        """Run this node on ONE sample and its labels"""
-
-        true_entities = set(get_entities(gold_tokens))
-        pred_entities = set(get_entities(predicted_tokens))
-
-        self.correct += len(true_entities & pred_entities)
-        self.pred += len(pred_entities)
-        self.true += len(true_entities)
-
-    def calc_metric(self):
-        logger.info(f"Calculating metrics in {self.__class__.__name__} with "
-                    f"correct={self.correct}, pred={self.pred}, true={self.true}")
-
-        micro_precision = self.correct / self.pred if self.pred > 0 else 0
-        micro_recall = self.correct / self.true if self.true > 0 else 0
-
-        if micro_precision + micro_recall == 0:
-            micro_f1 = 0
-        else:
-            micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
-        return {
-            EvalQueryResolution.micro_recall_key: micro_recall * 100,
-            EvalQueryResolution.micro_precision_key: micro_precision * 100,
-            EvalQueryResolution.micro_f1_key: micro_f1 * 100
-        }
-
-    def add_to_log(self):
-        result = self.calc_metric()
-        for k in result:
-            self.log[k].append(result[k])
-        self.init_counts()
-
-    def print(self, use_logged_values: bool, mode: str):
-        if use_logged_values is False:
-            result = self.calc_metric()
-            micro_recall = result[EvalQueryResolution.micro_recall_key]
-            micro_precision = result[EvalQueryResolution.micro_precision_key]
-            micro_f1 = result[EvalQueryResolution.micro_f1_key]
-            micro_recall_diff = micro_recall - self.log[EvalQueryResolution.micro_recall_key][-1]
-            micro_precision_diff = micro_precision - self.log[EvalQueryResolution.micro_precision_key][-1]
-            micro_f1_diff = micro_f1 - self.log[EvalQueryResolution.micro_f1_key][-1]
-        else:
-            micro_recall = self.log[EvalQueryResolution.micro_recall_key][-1]
-            micro_precision = self.log[EvalQueryResolution.micro_precision_key][-1]
-            micro_f1 = self.log[EvalQueryResolution.micro_f1_key][-1]
-            micro_recall_diff = micro_recall - self.log[EvalQueryResolution.micro_recall_key][-2]
-            micro_precision_diff = micro_precision - self.log[EvalQueryResolution.micro_precision_key][-2]
-            micro_f1_diff = micro_f1 - self.log[EvalQueryResolution.micro_f1_key][-2]
-
-        logger.info(f"\n"
-                    f"Micro recall   : {micro_recall:.4f} ({micro_recall_diff:.4f})\n"
-                    f"Micro precision: {micro_precision:.4f} ({micro_precision_diff:.4f})\n"
-                    f"Micro F1       : {micro_f1:.4f} ({micro_f1_diff:.4f})")
-
-    def last_recorded_is_the_highest_metric(self):
-        data = self.log[EvalQueryResolution.micro_f1_key]
-        return data.index(max(data)) == len(data) - 1
 
 
 def calculate_em_str_multi(gold_labels, prediction):
