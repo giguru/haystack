@@ -5,7 +5,6 @@ from typing import List, Optional, Union, Dict, Any
 from collections import defaultdict
 from time import perf_counter
 
-import numpy as np
 from farm.data_handler.data_silo import DataSilo
 from farm.data_handler.processor import SquadProcessor
 from farm.data_handler.dataloader import NamedDataLoader
@@ -13,12 +12,10 @@ from farm.data_handler.inputs import QAInput, Question
 from farm.infer import QAInferencer
 from farm.modeling.optimization import initialize_optimizer
 from farm.modeling.predictions import QAPred, QACandidate
-from farm.modeling.adaptive_model import BaseAdaptiveModel, AdaptiveModel
+from farm.modeling.adaptive_model import AdaptiveModel
 from farm.train import Trainer
 from farm.eval import Evaluator
 from farm.utils import set_all_seeds, initialize_device_settings
-from scipy.special import expit
-import shutil
 
 from haystack import Document
 from haystack.document_store.base import BaseDocumentStore
@@ -221,16 +218,9 @@ class FARMReader(BaseReader):
         # and calculates a few descriptive statistics of our datasets
         data_silo = DataSilo(processor=processor, batch_size=batch_size, distributed=False, max_processes=num_processes)
 
-        # Quick-fix until this is fixed upstream in FARM:
-        # We must avoid applying DataParallel twice (once when loading the inferencer,
-        # once when calling initalize_optimizer)
-        self.inferencer.model.save("tmp_model")
-        model = BaseAdaptiveModel.load(load_dir="tmp_model", device=device, strict=True)
-        shutil.rmtree('tmp_model')
-
         # 3. Create an optimizer and pass the already initialized model
         model, optimizer, lr_schedule = initialize_optimizer(
-            model=model,
+            model=self.inferencer.model,
             # model=self.inferencer.model,
             learning_rate=learning_rate,
             schedule_opts={"name": "LinearWarmup", "warmup_proportion": warmup_proportion},
@@ -449,6 +439,7 @@ class FARMReader(BaseReader):
             label_index: str = "label",
             doc_index: str = "eval_document",
             label_origin: str = "gold_label",
+            calibrate_conf_scores: bool = False
     ):
         """
         Performs evaluation on evaluation documents in the DocumentStore.
@@ -461,6 +452,8 @@ class FARMReader(BaseReader):
         :param device: The device on which the tensors should be processed. Choose from "cpu" and "cuda".
         :param label_index: Index/Table name where labeled questions are stored
         :param doc_index: Index/Table name where documents that are used for evaluation are stored
+        :param label_origin: Field name where the gold labels are stored
+        :param calibrate_conf_scores: Whether to calibrate the temperature for temperature scaling of the confidence scores
         """
 
         if self.top_k_per_candidate != 4:
@@ -493,33 +486,35 @@ class FARMReader(BaseReader):
                 "context": doc.text
             }
             # get all questions / answers
-            aggregated_per_question: Dict[str, Any] = defaultdict(list)
+            aggregated_per_question: Dict[tuple, Any] = defaultdict(list)
+            id_question_tuple = (label.id, label.question)
             if doc_id in aggregated_per_doc:
                 for label in aggregated_per_doc[doc_id]:
                     # add to existing answers
-                    if label.question in aggregated_per_question.keys():
+                    if id_question_tuple in aggregated_per_question.keys():
                         if label.offset_start_in_doc == 0 and label.answer == "":
                             continue
                         else:
                             # Hack to fix problem where duplicate questions are merged by doc_store processing creating a QA example with 8 annotations > 6 annotation max
-                            if len(aggregated_per_question[label.question]["answers"]) >= 6:
+                            if len(aggregated_per_question[id_question_tuple]["answers"]) >= 6:
+                                logger.warning(f"Answers in this sample are being dropped because it has more than 6 answers. (doc_id: {doc_id}, question: {label.question}, label_id: {label.id})")
                                 continue
-                            aggregated_per_question[label.question]["answers"].append({
+                            aggregated_per_question[id_question_tuple]["answers"].append({
                                         "text": label.answer,
                                         "answer_start": label.offset_start_in_doc})
-                            aggregated_per_question[label.question]["is_impossible"] = False
+                            aggregated_per_question[id_question_tuple]["is_impossible"] = False
                     # create new one
                     else:
                         # We don't need to create an answer dict if is_impossible / no_answer
                         if label.offset_start_in_doc == 0 and label.answer == "":
-                            aggregated_per_question[label.question] = {
+                            aggregated_per_question[id_question_tuple] = {
                                 "id": str(hash(str(doc_id) + label.question)),
                                 "question": label.question,
                                 "answers": [],
                                 "is_impossible": True
                             }
                         else:
-                            aggregated_per_question[label.question] = {
+                            aggregated_per_question[id_question_tuple] = {
                                 "id": str(hash(str(doc_id)+label.question)),
                                 "question": label.question,
                                 "answers": [{
@@ -543,7 +538,7 @@ class FARMReader(BaseReader):
 
         evaluator = Evaluator(data_loader=data_loader, tasks=self.inferencer.processor.tasks, device=device)
 
-        eval_results = evaluator.eval(self.inferencer.model)
+        eval_results = evaluator.eval(self.inferencer.model, calibrate_conf_scores=calibrate_conf_scores)
         toc = perf_counter()
         reader_time = toc - tic
         results = {
@@ -603,9 +598,29 @@ class FARMReader(BaseReader):
 
         return answers, max_no_ans_gap
 
-    @staticmethod
-    def _get_pseudo_prob(score: float):
-        return float(expit(np.asarray(score) / 8))
+    def calibrate_confidence_scores(
+            self,
+            document_store: BaseDocumentStore,
+            device: str,
+            label_index: str = "label",
+            doc_index: str = "eval_document",
+            label_origin: str = "gold_label"
+    ):
+        """
+        Calibrates confidence scores on evaluation documents in the DocumentStore.
+
+        :param document_store: DocumentStore containing the evaluation documents
+        :param device: The device on which the tensors should be processed. Choose from "cpu" and "cuda".
+        :param label_index: Index/Table name where labeled questions are stored
+        :param doc_index: Index/Table name where documents that are used for evaluation are stored
+        :param label_origin: Field name where the gold labels are stored
+        """
+        self.eval(document_store=document_store,
+                  device=device,
+                  label_index=label_index,
+                  doc_index=doc_index,
+                  label_origin=label_origin,
+                  calibrate_conf_scores=True)
 
     @staticmethod
     def _check_no_answer(c: QACandidate):
