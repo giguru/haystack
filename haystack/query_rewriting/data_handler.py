@@ -1,8 +1,7 @@
 import os
 import logging
 
-import numpy as np
-import json
+import datasets
 # Use external dependency Spacy, because QuReTec also uses Spacy
 import spacy
 
@@ -71,9 +70,6 @@ def get_spacy_parsed_word(word: str) -> Token:
     return cached_parsed_spacy_token[word]
 
 
-base = os.path.dirname(os.path.abspath(__file__))
-
-
 class CanardProcessor(Processor):
 
     label_name_key = "question"
@@ -86,22 +82,19 @@ class CanardProcessor(Processor):
         "[SEP]": "[SEP]",
     }
     """
-    Used to handle the QuAC that come in json format.
-    For more details on the dataset format, please visit: https://huggingface.co/datasets/quac
+    Used to handle the CANARD that come in json format.
+    For more details on the dataset format, please visit: https://huggingface.co/datasets/uva-irlab/canard_quretec
     For more information on using custom datasets, please visit: https://github.com/deepset-ai/FARM/blob/master/tutorials/2_Build_a_processor_for_your_own_dataset.ipynb
     """
 
     def __init__(self,
                  tokenizer: BertTokenizer,
+                 dataset_name: str = 'uva-irlab/canard_quretec',
                  max_seq_len=300,
-                 train_split: int = None,
-                 test_split: int = None,
-                 dev_split: int = None,
+                 train_split: str = None,
+                 test_split: str = None,
+                 dev_split: str = None,
                  verbose: bool = True,
-                 data_dir=base + '/canard/voskarides_preprocessed',
-                 train_filename: str = 'train_gold_supervision.json',
-                 test_filename: str = 'test_gold_supervision.json',
-                 dev_filename: str = 'dev_gold_supervision.json',
                  ):
         """
         :param: max_seq_len. The original authors of QuReTec have provided 300 as the max sequence length.
@@ -111,23 +104,31 @@ class CanardProcessor(Processor):
         # Always log this, so users have a log of the settings of their experiments
         logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}")
 
-        train_filename = data_dir + '/' + train_filename
-        test_filename = data_dir + '/' + test_filename
-        dev_filename = data_dir + '/' + dev_filename
-
+        loaded_datasets = datasets.load_dataset(
+            dataset_name,
+            split=[
+                f"train[{train_split}]" if train_split else 'train',
+                f"test[{test_split}]" if test_split else 'test',
+                f"validation[{dev_split}]" if dev_split else 'validation'
+            ]
+        )
         self.datasets = {
-            'train': json.load(open(train_filename))[0:train_split],
-            'test': json.load(open(test_filename))[0:test_split],
-            'dev': json.load(open(dev_filename))[0:dev_split]
+            'train': loaded_datasets[0],
+            'test': loaded_datasets[1],
+            'dev': loaded_datasets[2],
         }
+        data_dir = os.path.dirname(self.datasets['train'].cache_files[0]['filename'])
+        train_filename = os.path.basename(self.datasets['train'].cache_files[0]['filename'])
+        test_filename = os.path.basename(self.datasets['test'].cache_files[0]['filename'])
+        dev_filename = os.path.basename(self.datasets['dev'].cache_files[0]['filename'])
+
         super(CanardProcessor, self).__init__(tokenizer=tokenizer,
                                               max_seq_len=max_seq_len,
                                               train_filename=train_filename,
                                               dev_filename=dev_filename,
                                               test_filename=test_filename,
                                               data_dir=data_dir,
-                                              dev_split=0,
-                                              )
+                                              dev_split=0)
         self.add_task(name="ner",
                       metric="f1_micro",
                       label_list=self.get_labels(),
