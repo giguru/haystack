@@ -16,7 +16,7 @@ python-multipart
 python-docx
 sqlalchemy>=1.4.2
 sqlalchemy_utils
-torch==1.8.1+cu111
+# torch==1.8.1+cu111
 # for using FAISS with GPUs, install faiss-gpu
 faiss-gpu>=1.6.3
 tika
@@ -35,7 +35,7 @@ mmh3
 weaviate-client
 
 spacy
-datasets
 
 # Optional: For Anserini Document Store
 pyserini==0.12.0
+python-terrier

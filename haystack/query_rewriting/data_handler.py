@@ -10,8 +10,10 @@ from farm.data_handler.samples import Sample
 from farm.evaluation.metrics import register_metrics
 from spacy.tokens import Token
 from transformers import BertTokenizer
-from typing import List
+from typing import List, Optional
 import re
+
+from haystack import Label
 
 logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
@@ -88,8 +90,8 @@ class CanardProcessor(Processor):
     """
 
     def __init__(self,
-                 tokenizer: BertTokenizer,
-                 dataset_name: str = 'uva-irlab/canard_quretec',
+                 tokenizer: BertTokenizer = None,
+                 dataset_name: Optional[str] = 'uva-irlab/canard_quretec',
                  max_seq_len=300,
                  train_split: str = None,
                  test_split: str = None,
@@ -97,30 +99,35 @@ class CanardProcessor(Processor):
                  verbose: bool = True,
                  ):
         """
-        :param: max_seq_len. The original authors of QuReTec have provided 300 as the max sequence length.
+        :param max_seq_len. The original authors of QuReTec have provided 300 as the max sequence length.
+        :param dataset_name: The processor class was designed to work with the HuggingFace dataset
+                             'uva-irlab/canard_quretec'. Can be 'None' if you are using it for evaluation.
         """
         self._verbose = verbose
 
         # Always log this, so users have a log of the settings of their experiments
         logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}")
 
-        loaded_datasets = datasets.load_dataset(
-            dataset_name,
-            split=[
-                f"train[{train_split}]" if train_split else 'train',
-                f"test[{test_split}]" if test_split else 'test',
-                f"validation[{dev_split}]" if dev_split else 'validation'
-            ]
-        )
-        self.datasets = {
-            'train': loaded_datasets[0],
-            'test': loaded_datasets[1],
-            'dev': loaded_datasets[2],
-        }
-        data_dir = os.path.dirname(self.datasets['train'].cache_files[0]['filename'])
-        train_filename = os.path.basename(self.datasets['train'].cache_files[0]['filename'])
-        test_filename = os.path.basename(self.datasets['test'].cache_files[0]['filename'])
-        dev_filename = os.path.basename(self.datasets['dev'].cache_files[0]['filename'])
+        train_filename, dev_filename, test_filename, data_dir = None, None, None, None
+        if dataset_name is not None:
+            logger.info(f"Prepare {self.__class__.__name__} with dataset {dataset_name}")
+            loaded_datasets = datasets.load_dataset(
+                dataset_name,
+                split=[
+                    f"train[{train_split}]" if train_split else 'train',
+                    f"test[{test_split}]" if test_split else 'test',
+                    f"validation[{dev_split}]" if dev_split else 'validation'
+                ],
+            )
+            self.datasets = {
+                'train': loaded_datasets[0],
+                'test': loaded_datasets[1],
+                'dev': loaded_datasets[2],
+            }
+            data_dir = os.path.dirname(self.datasets['train'].cache_files[0]['filename'])
+            train_filename = os.path.basename(self.datasets['train'].cache_files[0]['filename'])
+            test_filename = os.path.basename(self.datasets['test'].cache_files[0]['filename'])
+            dev_filename = os.path.basename(self.datasets['dev'].cache_files[0]['filename'])
 
         super(CanardProcessor, self).__init__(tokenizer=tokenizer,
                                               max_seq_len=max_seq_len,
@@ -159,7 +166,6 @@ class CanardProcessor(Processor):
         return CanardProcessor.get_labels().index('[PAD]')
 
     def file_to_dicts(self, file: str) -> [dict]:
-
         test_filename_path = self.data_dir / self.test_filename
         if file == test_filename_path:
             return self.datasets['test']
@@ -181,36 +187,43 @@ class CanardProcessor(Processor):
         label_list = []
 
         for w in word_list:
-            l = get_spacy_parsed_word(w).lemma_
-            if l in gold_lemmas:
-                label_list.append(CanardProcessor.labels['RELEVANT'])
+            if len(gold_lemmas) > 0:
+                if get_spacy_parsed_word(w).lemma_ in gold_lemmas:
+                    label_list.append(CanardProcessor.labels['RELEVANT'])
+                else:
+                    label_list.append(CanardProcessor.labels['NOT_RELEVANT'])
             else:
                 label_list.append(CanardProcessor.labels['NOT_RELEVANT'])
 
         return word_list, label_list
 
+    def __combine_history_and_question(self, history: str, question: str):
+        return f"{history} {self.tokenizer.sep_token} {question}"
+
     def _dict_to_samples(self, dictionary: dict, **kwargs) -> [Sample]:
         """
+        :param dictionary
+
         """
-        question = dictionary['cur_question'].lower()
-        history = dictionary['prev_questions'].lower()
-        gold_terms = dictionary['gold_terms']
+        if 'cur_question' not in dictionary and 'query' not in dictionary:
+            raise KeyError(f'Please provide a `query` or `cur_question` key for the dict: {dictionary}')
+        question = dictionary.get('cur_question', dictionary['query']).lower()
+
+        if 'prev_questions' not in dictionary and 'history' not in dictionary:
+            raise KeyError(f'Please provide a `history` or `prev_questions` key for the dict: {dictionary}')
+        history = dictionary.get('prev_questions', dictionary['history']).lower()
+        gold_terms = dictionary.get('gold_terms', "")  # type: str
 
         # The authors of QuReTec by Voskarides et al. decided to separate the history and the current question
         # with a SEP token
-        tokenized_text = f"{history} {self.tokenizer.sep_token} {question}"
+        tokenized_text = self.__combine_history_and_question(history=history, question=question)
 
         # TODO add ability to use another data set than the preprocessed one of Voskarides
-        # word_list, label_list = self.relevant_terms(history=tokenized_text,
-        #                                             gold_source=dictionary['answer_text_with_window'])
-        word_list = dictionary['bert_ner_overlap'][0]
-        label_list = dictionary['bert_ner_overlap'][1]
-
-        if len(word_list) != len(dictionary['bert_ner_overlap'][0]): # TODO remove for final commit
-            raise ValueError(f"The word list is parsed differently than Voskarides: {word_list}")
-
-        if label_list != dictionary['bert_ner_overlap'][1]: # TODO remove for final commit
-            raise ValueError(f"Label list is constructed differently than Voskarides: {word_list}")
+        if 'bert_ner_overlap' in dictionary:
+            word_list = dictionary['bert_ner_overlap'][0]
+            label_list = dictionary['bert_ner_overlap'][1]
+        else:
+            word_list, label_list = self.relevant_terms(history=tokenized_text, gold_source=gold_terms)
 
         tokenized = self._quretec_tokenize_with_metadata(words_list=word_list, labellist=label_list)
 
@@ -263,6 +276,22 @@ class CanardProcessor(Processor):
             "label_mask": label_mask,
             'valid': valid,
         }
+
+    @staticmethod
+    def to_haystack_label(d: dict, origin: str = '') -> Label:
+        """
+        Convert an entry from CANARD into a Haystack Label
+        """
+        return Label(
+            question=d['cur_question'],
+            answer=d['answer_text_with_window'],
+            is_correct_answer=True,
+            is_correct_document=True,
+            origin=origin,
+            document_id=d['id'],
+            id=d['id'],
+            meta=d
+        )
 
     def _sample_to_features(self, sample: Sample) -> List[dict]:
         """

@@ -1,9 +1,14 @@
 import json
 import re
+from typing import List
+
 import torch
 import logging
+from tqdm import tqdm
 from pathlib import Path
 
+from farm.data_handler.dataloader import NamedDataLoader
+from farm.data_handler.processor import Processor
 from farm.eval import Evaluator
 from farm.modeling.prediction_head import TokenClassificationHead
 from farm.train import Trainer
@@ -187,7 +192,10 @@ class QueryResolutionModel(BertForTokenClassification):
 
 
 class QueryResolution(BaseComponent):
+    outgoing_edges = 1
+
     def __init__(self,
+                 processor: Processor = None,
                  config: BertConfig = None,
                  bert_model: str = 'bert-large-uncased',
                  pretrained_model_path: str = None,
@@ -196,6 +204,10 @@ class QueryResolution(BaseComponent):
                  tokenizer_args: dict = {},
                  model_args: dict = {},
     ):
+        self.set_config(
+            config=config,
+            bert_model=bert_model
+        )
         """
         Query resolution for Session based pipeline runs. This component is based on the paper:
         Query Resolution for Conversational Search with Limited Supervision
@@ -214,13 +226,18 @@ class QueryResolution(BaseComponent):
             self.n_gpu = 1
 
         if pretrained_model_path:
-            self.model = QueryResolutionModel.from_pretrained(pretrained_model_path, device=device, **model_args)
+            self.model = QueryResolutionModel.from_pretrained(pretrained_model_path, device=device, config=config, **model_args)
         else:
             self.model = QueryResolutionModel(config=config, device=device, **model_args)
         self.device = torch.device(device)
+        self.processor = processor
+
+        # modify
+        if not self.processor.tokenizer:
+            self.processor.tokenizer = self.tokenizer
+        self.model = self.model.to(self.device)
 
     def train(self,
-              processor,
               learning_rate: float = 5e-5,
               batch_size: int = 4,
               gradient_clipping: float = 1.0,
@@ -244,7 +261,7 @@ class QueryResolution(BaseComponent):
         if datasilo_args is None:
             datasilo_args = { "caching": False }
 
-        self.data_silo = DataSilo(processor=processor,
+        self.data_silo = DataSilo(processor=self.processor,
                                   batch_size=batch_size,
                                   distributed=False,
                                   max_processes=1,
@@ -288,7 +305,7 @@ class QueryResolution(BaseComponent):
             'hidden_dropout_prob': self.model.config.hidden_dropout_prob
         }
         model_save_dir = Path(save_dir) / ("query_resolution_" + dict_to_string(params_dict))
-        self.model.save(model_save_dir, id_to_label=processor.id_to_label)
+        self.model.save(model_save_dir, id_to_label=self.processor.id_to_label)
         self.tokenizer.save_pretrained(save_directory=str(model_save_dir))
 
     def _get_results(self, batch, logits):
@@ -364,7 +381,6 @@ class QueryResolution(BaseComponent):
                         f'the result is: {str(relevant_tokens["output"])}')
 
     def eval(self,
-             processor,
              data_set: str = 'test',
              eval_report: bool = True,
              batch_size: int = 4,
@@ -374,7 +390,7 @@ class QueryResolution(BaseComponent):
             datasilo_args = {"caching": False}
 
         self.model = self.model.to(self.device)
-        self.data_silo = DataSilo(processor=processor,
+        self.data_silo = DataSilo(processor=self.processor,
                                   batch_size=batch_size,
                                   distributed=False,
                                   max_processes=1,
@@ -383,16 +399,47 @@ class QueryResolution(BaseComponent):
 
         evaluator = Evaluator(
             data_loader=self.data_silo.get_data_loader(data_set),
-            tasks=processor.tasks,
+            tasks=self.processor.tasks,
             device=self.device,
             report=eval_report
         )
         results = evaluator.eval(self.model, return_preds_and_labels=True)
         evaluator.log_results(results, data_set, 0)
 
-    def run(self, question: str, history):
-        """
-        Rewrite a single question + history ad hoc instead of using a data set.
-        """
+    def predictions_to_terms(self, batch: dict, predictions: List[List[str]]):
+        relevant_inputs = [batch['input_ids'][i][batch['label_attention_mask'][i] == 1].tolist() for i in range(len(batch['input_ids']))]
 
-        pass
+        terms = []
+        for b in range(len(relevant_inputs)):
+            assert len(relevant_inputs[b]) == len(predictions[b])
+            terms.append([])
+            for i in range(len(predictions[b])):
+                # TODO take valid ids into account
+                if predictions[b][i] == 'REL':
+                    terms[b].append(relevant_inputs[b][i])
+        return [self.processor.tokenizer.convert_ids_to_tokens(terms[i]) for i in range(len(terms))]
+
+
+    def run(self, query, **kwargs):
+        self.model.connect_heads_with_processor(self.processor.tasks, require_labels=True)
+        dataset, tensor_names, problematic_samples = self.processor.dataset_from_dicts(dicts=[{'query': query, **kwargs}])
+        data_loader = NamedDataLoader(dataset=dataset, batch_size=1, tensor_names=tensor_names)
+
+        for step, batch in enumerate(
+            tqdm(data_loader, desc="Evaluating", mininterval=10)
+        ):
+            batch = {key: batch[key].to(self.device) for key in batch}
+            with torch.no_grad():
+                logits = self.model.forward(**batch)
+                losses_per_head = self.model.logits_to_loss_per_head(logits=logits, **batch)
+                preds_per_head = self.model.logits_to_preds(logits=logits, **batch)
+                predicted_terms = self.predictions_to_terms(batch=batch, predictions=preds_per_head[0])[0]
+
+                # The predicted terms can contain duplicates. Only get the distinct values
+                predicted_terms = list(set(predicted_terms))
+
+            output = {
+                **kwargs,
+                'query': f"{query} {' '.join(predicted_terms)}"
+            }
+        return output, "output_1"
