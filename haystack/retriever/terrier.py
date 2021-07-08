@@ -166,15 +166,17 @@ class TerrierRetriever(BaseRetriever):
         from jnius import JavaException
         try:
             for _, row in self.batch_retriever.search(cleaned_text).iterrows():
-                if self.pt_dataset:
-                    meta = {key: row[key] for key in row.keys() if key not in ['docid', 'text', 'score']}
-                    results.append(Document(id=row['docid'],
+                if self.pt_dataset or self.huggingface_dataset:
+                    meta = {key: row[key] for key in row.keys() if key not in ['docno', 'text', 'score']}
+                    results.append(Document(id=row['docno'],
                                             text=row['text'],
                                             score=row['score'],
                                             meta=meta
                                             ))
                 elif self.document_store:
-                    results.append(self._get_document(row["docid"]))
+                    results.append(self._get_document(row["docno"]))
+                else:
+                    raise NotImplementedError("I don't know what's happening, but no results are being returned...")
         except JavaException as ja:
             print('\n\t'.join(ja.stacktrace))
         return results
