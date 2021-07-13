@@ -38,6 +38,8 @@ class TerrierRetriever(BaseRetriever):
         self.top_k = top_k
         self._indexer_args = indexer_args or {'type': pt.IndexingType.CLASSIC, 'overwrite': False}
         self._indexer_class = indexer_class or pt.IterDictIndexer
+        self.MAX_DOC_ID_LEN = 50
+        self.MAX_TEXT_LEN = 4096
 
         if document_store is None and pt_dataset is None and huggingface_dataset is None:
             raise KeyError(f"Please provide either a `document_store`, `pt_dataset` or `huggingface_dataset`. "
@@ -86,6 +88,8 @@ class TerrierRetriever(BaseRetriever):
         for i, doc in enumerate(documents, 1):
             if print_every > 0 and i % print_every == 0:
                 log.debug(f"\t{i} of {N} done")
+            if len(doc.id) > self.MAX_DOC_ID_LEN:
+                log.warning(f"DocumentStore Document {doc.id} has an ID longer than {self.MAX_DOC_ID_LEN}")
             yield {
                 "text": self._clean_text(doc.text),
                 "docno": doc.id
@@ -98,6 +102,8 @@ class TerrierRetriever(BaseRetriever):
                 raise KeyError('The item to be indexed should contain the keys `docno` and `text`. If the dataset does'
                                'not have these keys, please provide a `huggingface_dataset_converter` when'
                                'constructing')
+            if len(return_item['docno']) > self.MAX_DOC_ID_LEN:
+                log.warning(f"Dataset document {return_item['docno']} has an ID longer than {self.MAX_DOC_ID_LEN}")
             yield return_item
 
     def __get_iter_indexer(self):
@@ -121,7 +127,7 @@ class TerrierRetriever(BaseRetriever):
         else:
             self.index_ref = iter_indexer.index(self._huggingface_dataset_iter(),
                                                 meta=['docno', 'text'],
-                                                meta_lengths=[20, 4096])
+                                                meta_lengths=[self.MAX_DOC_ID_LEN, self.MAX_TEXT_LEN])
         self.__set_batch_retriever()
         log.debug("Building index using PYTerrier Dataset complete!")
 
@@ -134,7 +140,7 @@ class TerrierRetriever(BaseRetriever):
         else:
             self.index_ref = iter_indexer.index(self.pt_dataset.get_corpus_iter(),
                                                 meta=['docno', 'text'],
-                                                meta_lengths=[20, 4096])
+                                                meta_lengths=[self.MAX_DOC_ID_LEN, self.MAX_TEXT_LEN])
         self.__set_batch_retriever()
         log.debug("Building index using PYTerrier Dataset complete!")
 
@@ -142,7 +148,10 @@ class TerrierRetriever(BaseRetriever):
         log.debug("Building index using Document Store")
         iter_indexer = self.__get_iter_indexer()
         documents = self.document_store.get_all_documents()
-        self.index_ref = iter_indexer.index(self._document_store_iter(documents), fields=("text",))
+        self.index_ref = iter_indexer.index(self._document_store_iter(documents),
+                                            meta=['docno', 'text'],
+                                            meta_lengths=[self.MAX_DOC_ID_LEN, self.MAX_TEXT_LEN]
+                                            )
         self.__set_batch_retriever()
         log.debug("Building index using Document Store complete!")
 
