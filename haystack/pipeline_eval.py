@@ -1,10 +1,8 @@
 from haystack.document_store.elasticsearch import ElasticsearchDocumentStore
 from haystack.preprocessor.utils import fetch_archive_from_http
 from haystack.retriever.sparse import ElasticsearchRetriever
-from haystack.retriever.dense import DensePassageRetriever
 from haystack.reader.farm import FARMReader
 from haystack import Pipeline
-from farm.utils import initialize_device_settings
 from haystack.preprocessor import PreProcessor
 from haystack.eval import EvalAnswers, EvalDocuments
 

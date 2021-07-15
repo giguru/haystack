@@ -1,6 +1,8 @@
 import inspect
+import json
 import logging
 import os
+import time
 import traceback
 from abc import ABC
 from copy import deepcopy
@@ -16,7 +18,7 @@ import yaml
 from networkx import DiGraph
 from networkx.drawing.nx_agraph import to_agraph
 
-from haystack import BaseComponent
+from haystack import BaseComponent, MultiLabel
 from haystack.generator.base import BaseGenerator
 from haystack.reader.base import BaseReader
 from haystack.retriever.base import BaseRetriever
@@ -345,6 +347,36 @@ class Pipeline:
 
         with open(path, 'w') as outfile:
             yaml.dump(config, outfile, default_flow_style=False)
+
+    def eval_qrels(self, eval_component_name: str, qrels: Dict[str, list], topics: List, dump_results: bool = True):
+        results = {}
+
+        for topic in topics:
+            id, query = topic['qid'], topic['query']
+            if id in qrels:
+                relevant_doc_ids = [docid for (docid, rank) in qrels[id].items() if int(rank) > 0]
+            else:
+                relevant_doc_ids = []
+            result = self.run(query=query,
+                              history=" ".join(topic['history']),
+                              id=id,
+                              labels={
+                                  eval_component_name: MultiLabel(query,
+                                                                  multiple_document_ids=relevant_doc_ids,
+                                                                  multiple_answers=[],
+                                                                  multiple_offset_start_in_docs=[],
+                                                                  is_correct_answer=True,
+                                                                  origin="qrels",
+                                                                  is_correct_document=True)
+                              })
+            results[id] = [d.id for d in result['documents']]
+
+        if dump_results:
+            filename = f"result-{time.strftime('%Y%m%d-%H%M')}.json"
+            with open(filename, "w") as fp:
+                json.dump(results, fp)
+                logger.info(f"Saved results to {filename}")
+        return results
 
 
 class BaseStandardPipeline(ABC):

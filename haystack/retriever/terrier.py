@@ -73,6 +73,7 @@ class TerrierRetriever(BaseRetriever):
             self.index_path = self.config.get("index_path", './terrier_indexed')
             self.document_store = document_store
             self._build_index_using_document_store()
+        log.info(f"{self.__class__.__name__} with config={config_json}")
 
     def _clean_text(self, text):
         """
@@ -114,9 +115,9 @@ class TerrierRetriever(BaseRetriever):
 
         log.debug(f"Index stats:\n{index_inst.getCollectionStatistics().toString()}")
         self.batch_retriever = pt.BatchRetrieve(index_inst,
-                                                wmodel=self.wmodel,
                                                 num_results=self.top_k,
-                                                metadata=['docno', 'text'])
+                                                metadata=['docno', 'text'],
+                                                **self.config)
 
     def _build_index_using_huggingface_dataset(self):
         log.debug("Building index using HuggingFace Dataset")

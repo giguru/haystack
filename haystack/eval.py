@@ -6,6 +6,7 @@ from haystack import MultiLabel, Label
 
 from farm.evaluation.squad_evaluation import compute_f1 as calculate_f1_str
 from farm.evaluation.squad_evaluation import compute_exact as calculate_em_str
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,13 @@ class EvalDocuments:
     a look at our evaluation tutorial for more info about open vs closed domain eval (
     https://haystack.deepset.ai/docs/latest/tutorial5md).
     """
-    def __init__(self, debug: bool=False, open_domain: bool=True, top_k_eval_documents: int=10, name="EvalDocuments"):
+    def __init__(self,
+                 debug: bool=False,
+                 open_domain: bool=True,
+                 top_k_eval_documents: int = 10,
+                 top_k_eval_documents_ndcg: int = 3,
+                 ndcg_base: int = 2,
+                 name="EvalDocuments"):
         """
         :param open_domain: When True, a document is considered correctly retrieved so long as the answer string can be found within it.
                             When False, correct retrieval is evaluated based on document_id.
@@ -33,6 +40,8 @@ class EvalDocuments:
         self.log: List = []
         self.open_domain = open_domain
         self.top_k_eval_documents = top_k_eval_documents
+        self.top_k_eval_documents_ndcg = top_k_eval_documents_ndcg
+        self.ndcg_base = ndcg_base
         self.name = name
         self.too_few_docs_warning = False
         self.top_k_used = 0
@@ -49,6 +58,14 @@ class EvalDocuments:
         self.has_answer_mean_reciprocal_rank = 0.0
         self.reciprocal_rank_sum = 0.0
         self.has_answer_reciprocal_rank_sum = 0.0
+
+        # For mean average precision
+        self.mean_average_precision = 0.0
+        self.average_precision_sum = 0.0
+
+        # For NDCG
+        self.sum_ndcg_at_k = 0.0
+        self.average_ndcg_at_k = 0.0
 
     def run(self, documents, labels: dict, top_k_eval_documents: Optional[int]=None, **kwargs):
         """Run this node on one sample and its labels"""
@@ -78,11 +95,19 @@ class EvalDocuments:
             correct_retrieval = 1
             retrieved_reciprocal_rank = 1
             self.reciprocal_rank_sum += 1
+            # For MAP
+            average_precision = 1
+            self.average_precision_sum += average_precision
+
+            ndcg = 1
+            self.sum_ndcg_at_k += ndcg
             if not self.no_answer_warning:
                 self.no_answer_warning = True
                 logger.warning("There seem to be empty string labels in the dataset suggesting that there "
                                "are samples with is_impossible=True. "
                                "Retrieval of these samples is always treated as correct.")
+
+
         # If there are answer span annotations in the labels
         else:
             self.has_answer_count += 1
@@ -94,18 +119,48 @@ class EvalDocuments:
             self.has_answer_recall = self.has_answer_correct / self.has_answer_count
             self.has_answer_mean_reciprocal_rank = self.has_answer_reciprocal_rank_sum / self.has_answer_count
 
+            # For computing MAP
+            average_precision = self.average_precision_retrieved(retriever_labels, documents, top_k_eval_documents)
+            self.average_precision_sum += average_precision
+
+            # For computing NDCG
+            ndcg = self.compute_ndcg(retriever_labels, documents)
+            self.sum_ndcg_at_k += ndcg
+
         self.correct_retrieval_count += correct_retrieval
         self.recall = self.correct_retrieval_count / self.query_count
         self.mean_reciprocal_rank = self.reciprocal_rank_sum / self.query_count
+        self.mean_average_precision = self.average_precision_sum / self.query_count
+        self.average_ndcg_at_k = self.sum_ndcg_at_k / self.query_count
 
         self.top_k_used = top_k_eval_documents
 
+        return_dict = {"documents": documents,
+                       "labels": labels,
+                       "correct_retrieval": correct_retrieval,
+                       "retrieved_reciprocal_rank": retrieved_reciprocal_rank,
+                       "average_precision": average_precision,
+                       **kwargs}
         if self.debug:
-            self.log.append({"documents": documents, "labels": labels, "correct_retrieval": correct_retrieval, "retrieved_reciprocal_rank": retrieved_reciprocal_rank, **kwargs})
-        return {"documents": documents, "labels": labels, "correct_retrieval": correct_retrieval, "retrieved_reciprocal_rank": retrieved_reciprocal_rank, **kwargs}, "output_1"
+            self.log.append(return_dict)
+        return return_dict, "output_1"
 
     def is_correctly_retrieved(self, retriever_labels, predictions):
         return self.reciprocal_rank_retrieved(retriever_labels, predictions) > 0
+
+    def compute_ndcg(self, retriever_labels, predictions):
+        scores = predictions[0:self.top_k_eval_documents_ndcg]
+        ideal_ranking = dict(sorted(retriever_labels.items(), key=lambda x: x.score, reverse=True)[:self.top_k_eval_documents_ndcg])
+        dcg = 0
+        idcg = 0
+        for i, score in enumerate(scores):
+            if i == 0:
+                dcg += score / math.log(i+1, self.ndcg_base)
+                idcg += ideal_ranking[i] / math.log(i+1, self.ndcg_base)
+            else:
+                dcg = score
+                idcg = ideal_ranking[i]
+        return dcg / idcg if idcg > 0 else 0
 
     def reciprocal_rank_retrieved(self, retriever_labels, predictions, top_k_eval_documents):
         if self.open_domain:
@@ -122,6 +177,17 @@ class EvalDocuments:
                     return 1/(rank+1)
             return 0
 
+    def average_precision_retrieved(self, retriever_labels, predictions, top_k_eval_documents):
+        prediction_ids = [p.id for p in predictions[:top_k_eval_documents]]
+        label_ids = set(retriever_labels.multiple_document_ids)
+        correct = 0
+        total = 0
+        for rank, p in enumerate(prediction_ids):
+            if p in label_ids:
+                correct += 1
+                total += correct / (rank + 1)
+        return total / correct if correct > 0 else 0
+
     def print(self):
         """Print the evaluation results"""
         print(self.name)
@@ -137,6 +203,8 @@ class EvalDocuments:
                 f"no_answer mean_reciprocal_rank@{self.top_k_used}:  1.0000 (no_answer samples are always treated as correctly retrieved at rank 1)")
         print(f"recall@{self.top_k_used}: {self.recall:.4f} ({self.correct_retrieval_count} / {self.query_count})")
         print(f"mean_reciprocal_rank@{self.top_k_used}: {self.mean_reciprocal_rank:.4f}")
+        print(f"mean_average_precision@{self.top_k_used}: {self.mean_average_precision:.4f}")
+        print(f"ndcg@{self.top_k_eval_documents_ndcg}: {self.average_ndcg_at_k:.4f}")
 
 
 class EvalAnswers:

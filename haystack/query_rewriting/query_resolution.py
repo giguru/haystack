@@ -19,6 +19,7 @@ from farm.modeling.optimization import initialize_optimizer
 from farm.data_handler.data_silo import DataSilo
 from haystack import BaseComponent
 
+__all__ = ['QuReTecTokenClassicationHead', 'QueryResolution', 'QueryResolutionModel']
 logger = logging.getLogger(__name__)
 
 
@@ -233,7 +234,7 @@ class QueryResolution(BaseComponent):
         self.processor = processor
 
         # modify
-        if not self.processor.tokenizer:
+        if self.processor is not None and not self.processor.tokenizer:
             self.processor.tokenizer = self.tokenizer
         self.model = self.model.to(self.device)
 
@@ -255,7 +256,7 @@ class QueryResolution(BaseComponent):
         :param: n_epochs
             Default value is 3, because Voskarides et al. their QuReTec model was trained in 3 epochs.
         """
-        logger.info(f'Training QueryResolution with batch_size={batch_size}, gradient_clipping={gradient_clipping}, '
+        logger.info(f'Training {self.__class__.__name} with batch_size={batch_size}, gradient_clipping={gradient_clipping}, '
                     f'epsilon={epsilon}, n_gpu={self.n_gpu}, grad_acc_steps={grad_acc_steps}, evaluate_every={evaluate_every}, '
                     f'early_stopping={early_stopping}')
         if datasilo_args is None:

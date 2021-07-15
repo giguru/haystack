@@ -17,6 +17,7 @@ from haystack import Label
 
 logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
+__all__ = ['QuretecProcessor']
 
 cached_parsed_spacy_token = {}
 
@@ -72,7 +73,7 @@ def get_spacy_parsed_word(word: str) -> Token:
     return cached_parsed_spacy_token[word]
 
 
-class CanardProcessor(Processor):
+class QuretecProcessor(Processor):
 
     label_name_key = "question"
     gold_terms = "gold"
@@ -129,13 +130,13 @@ class CanardProcessor(Processor):
             test_filename = os.path.basename(self.datasets['test'].cache_files[0]['filename'])
             dev_filename = os.path.basename(self.datasets['dev'].cache_files[0]['filename'])
 
-        super(CanardProcessor, self).__init__(tokenizer=tokenizer,
-                                              max_seq_len=max_seq_len,
-                                              train_filename=train_filename,
-                                              dev_filename=dev_filename,
-                                              test_filename=test_filename,
-                                              data_dir=data_dir,
-                                              dev_split=0)
+        super(QuretecProcessor, self).__init__(tokenizer=tokenizer,
+                                               max_seq_len=max_seq_len,
+                                               train_filename=train_filename,
+                                               dev_filename=dev_filename,
+                                               test_filename=test_filename,
+                                               data_dir=data_dir,
+                                               dev_split=0)
         self.add_task(name="ner",
                       metric="f1_micro",
                       label_list=self.get_labels(),
@@ -148,22 +149,22 @@ class CanardProcessor(Processor):
     def get_labels():
         return [
             '[PAD]',
-            CanardProcessor.labels['NOT_RELEVANT'],
-            CanardProcessor.labels['RELEVANT'],
+            QuretecProcessor.labels['NOT_RELEVANT'],
+            QuretecProcessor.labels['RELEVANT'],
             "[CLS]",
             "[SEP]"
         ]
 
     @staticmethod
     def label2id():
-        return {label: i for i, label in enumerate(CanardProcessor.get_labels())}
+        return {label: i for i, label in enumerate(QuretecProcessor.get_labels())}
 
     @staticmethod
     def id2label():
-        return {i: label for i, label in enumerate(CanardProcessor.get_labels())}
+        return {i: label for i, label in enumerate(QuretecProcessor.get_labels())}
 
     def pad_token_id():
-        return CanardProcessor.get_labels().index('[PAD]')
+        return QuretecProcessor.get_labels().index('[PAD]')
 
     def file_to_dicts(self, file: str) -> [dict]:
         test_filename_path = self.data_dir / self.test_filename
@@ -189,11 +190,11 @@ class CanardProcessor(Processor):
         for w in word_list:
             if len(gold_lemmas) > 0:
                 if get_spacy_parsed_word(w).lemma_ in gold_lemmas:
-                    label_list.append(CanardProcessor.labels['RELEVANT'])
+                    label_list.append(QuretecProcessor.labels['RELEVANT'])
                 else:
-                    label_list.append(CanardProcessor.labels['NOT_RELEVANT'])
+                    label_list.append(QuretecProcessor.labels['NOT_RELEVANT'])
             else:
-                label_list.append(CanardProcessor.labels['NOT_RELEVANT'])
+                label_list.append(QuretecProcessor.labels['NOT_RELEVANT'])
 
         return word_list, label_list
 
@@ -233,9 +234,9 @@ class CanardProcessor(Processor):
         return [
             Sample(id=f"{dictionary['id']}",
                    clear_text={
-                       CanardProcessor.label_name_key: question,
+                       QuretecProcessor.label_name_key: question,
                        'tokenized_text': tokenized_text,
-                       CanardProcessor.gold_terms: gold_terms,
+                       QuretecProcessor.gold_terms: gold_terms,
                    },
                    tokenized=tokenized)
         ]
