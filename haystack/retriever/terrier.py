@@ -1,15 +1,12 @@
 import logging
 import re
-from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 import os
-import pandas as pd
 import pyterrier as pt
 from datasets import Dataset
 
 from haystack import Document
 from haystack.retriever.base import BaseRetriever
-from haystack.document_store.base import BaseDocumentStore
 
 log = logging.getLogger(__name__)
 
@@ -19,14 +16,14 @@ class TerrierRetriever(BaseRetriever):
                  config_json: dict,
                  top_k: int,
                  document_store = None,
-                 pt_dataset: str = None,
+                 prebuilt_index_name: str = None,
                  huggingface_dataset: Dataset = None,
                  huggingface_dataset_converter = None,
                  indexer_args: dict = None,
                  indexer_class = None,
                  ):
         """
-        @type pt_dataset: str
+        @type prebuilt_index_name: str
             PyTerrier provides several data sets. For the full list, please consult:
             https://pyterrier.readthedocs.io/en/latest/datasets.html
         @type document_store: BaseDocumentStore
@@ -41,8 +38,8 @@ class TerrierRetriever(BaseRetriever):
         self.MAX_DOC_ID_LEN = 50
         self.MAX_TEXT_LEN = 4096
 
-        if document_store is None and pt_dataset is None and huggingface_dataset is None:
-            raise KeyError(f"Please provide either a `document_store`, `pt_dataset` or `huggingface_dataset`. "
+        if document_store is None and prebuilt_index_name is None and huggingface_dataset is None:
+            raise KeyError(f"Please provide either a `document_store`, `prebuilt_index_name` or `huggingface_dataset`. "
                            f"A possible pt_datasets is e.g. 'trec-deep-learning-passages'. "
                            f"The following datasets are included in Terrier: {pt.list_datasets()}")
 
@@ -65,9 +62,9 @@ class TerrierRetriever(BaseRetriever):
             self.huggingface_dataset = huggingface_dataset
             self._huggingface_dataset_converter = huggingface_dataset_converter
             self._build_index_using_huggingface_dataset()
-        elif pt_dataset is not None:
-            self.index_path = self.config.get("index_path", './terrier_'+pt_dataset)
-            self.pt_dataset = pt.get_dataset(pt_dataset)
+        elif prebuilt_index_name is not None:
+            self.index_path = self.config.get("index_path", './terrier_' + prebuilt_index_name)
+            self.pt_dataset = pt.get_dataset(prebuilt_index_name)
             self._build_index_using_pt_dataset()
         elif document_store is not None:
             self.index_path = self.config.get("index_path", './terrier_indexed')
