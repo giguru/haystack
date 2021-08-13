@@ -253,7 +253,7 @@ class QueryResolution(BaseComponent):
               early_stopping: int = None,
               ):
         """
-        :param: n_epochs
+        :param: n_epochs: int
             Default value is 3, because Voskarides et al. their QuReTec model was trained in 3 epochs.
         """
         logger.info(f'Training {self.__class__.__name} with batch_size={batch_size}, gradient_clipping={gradient_clipping}, '
@@ -420,15 +420,12 @@ class QueryResolution(BaseComponent):
                     terms[b].append(relevant_inputs[b][i])
         return [self.processor.tokenizer.convert_ids_to_tokens(terms[i]) for i in range(len(terms))]
 
-
     def run(self, query, **kwargs):
         self.model.connect_heads_with_processor(self.processor.tasks, require_labels=True)
         dataset, tensor_names, problematic_samples = self.processor.dataset_from_dicts(dicts=[{'query': query, **kwargs}])
         data_loader = NamedDataLoader(dataset=dataset, batch_size=1, tensor_names=tensor_names)
 
-        for step, batch in enumerate(
-            tqdm(data_loader, desc="Evaluating", mininterval=10)
-        ):
+        for step, batch in enumerate(data_loader):
             batch = {key: batch[key].to(self.device) for key in batch}
             with torch.no_grad():
                 logits = self.model.forward(**batch)
@@ -441,6 +438,7 @@ class QueryResolution(BaseComponent):
 
             output = {
                 **kwargs,
+                'original_query': query,
                 'query': f"{query} {' '.join(predicted_terms)}"
             }
         return output, "output_1"
