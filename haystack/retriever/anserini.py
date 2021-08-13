@@ -1,8 +1,6 @@
-from typing import List, Dict
+from typing import List, Dict, Callable
 from datasets import Dataset
-from pyserini.index._base import JGenerators
 from pyserini.search import SimpleSearcher
-from pyserini.index import Generator
 from haystack import Document
 from haystack.retriever.base import BaseRetriever
 import logging
@@ -18,13 +16,23 @@ class SparseAnseriniRetriever(BaseRetriever):
                  top_k: int = 1000,
                  prebuilt_index_name: str = None,
                  huggingface_dataset: Dataset = None,
-                 huggingface_dataset_converter = None
+                 huggingface_dataset_converter: Callable = None,
+                 num_threads: int = 3,
                  ):
         """
         @param prebuilt_index_name: str
             E.g. robust04, msmarco-passage-slim, msmarco-passage or cast2019. For all available prebuilt indexes,
             please call pyserini.SimpleSearcher.list_prebuilt_indexes() or search on Google.
+        @param huggingface_dataset: Dataset
+            Please check if you need to provided a huggingface_dataset_converter as well
+        @param huggingface_dataset_converter: Callable
+            The object provided to anserini for indexing requires two keys: `id` and `contents`. If the entries in the
+            huggingface dataset do not provide these keys, please provider a converter function:
+            e.g. lamda d: {'id': d[...], 'contents': d[...]}
+        @param num_threads: int
+            Indexing anserini allows for multithreading
         """
+        self.num_threads = num_threads
         if prebuilt_index_name is not None:
             self.searcher = SimpleSearcher.from_prebuilt_index(prebuilt_index_name)
         elif huggingface_dataset is not None:
@@ -46,8 +54,8 @@ class SparseAnseriniRetriever(BaseRetriever):
 
         self.top_k = top_k
 
-    def _build_index_using_huggingface(self, dataset: Dataset, converter = None):
-        index_path = './huggingface_' + dataset.info.builder_name
+    def _build_index_using_huggingface(self, dataset: Dataset, converter=None):
+        index_path = './huggingface_anserini_' + dataset.info.builder_name
         if os.path.isfile(index_path):
             logger.info(f"Using existing Lucene index: {index_path}")
         else:
@@ -56,41 +64,51 @@ class SparseAnseriniRetriever(BaseRetriever):
             if os.path.isfile(temp_jsonl_file):
                 os.remove(temp_jsonl_file)
 
-            with open(f'{temp_jsonl_file}') as writer:
-                n_empty_documents = []
-                for doc in dataset:
-                    doc_to_index = converter(doc) if converter else doc
-                    if 'id' not in doc_to_index:
-                        raise KeyError(f'Each document should have an ID! Object: {doc_to_index}')
-                    if 'content' not in doc_to_index or not doc_to_index['content']:
-                        n_empty_documents.append(doc_to_index['id'])
-                    else:
-                        writer.write(json.dump(doc_to_index, separators=(',', ':')) + '\n')
+            n_empty_documents = []
+            writer = open(f'{temp_jsonl_file}', 'w')
+            for doc in dataset:
+                doc_to_index = converter(doc) if converter else doc
+                if 'id' not in doc_to_index:
+                    raise KeyError(f'Each document should have an ID! Object: {doc_to_index}')
+                if 'content' not in doc_to_index or not doc_to_index['content']:
+                    n_empty_documents.append(doc_to_index['id'])
 
-                if len(n_empty_documents) > 0:
-                    logger.info(f"{len(n_empty_documents)} documents were not indexed: {', '.join(n_empty_documents)}")
+                writer.write(json.dumps(doc_to_index, separators=(',', ':')) + '\n')
+                break
+            writer.close()
 
-                from jnius import autoclass
-                JIndexCollection = autoclass('io.anserini.index.IndexCollection')
-                JIndexCollection.main({
-                    'generator': JGenerators.DefaultLuceneDocumentGenerator.value,
-                    'collection': 'JsonCollection',
-                    'input': temp_jsonl_file,
-                    'index': index_path
-                })
+            if len(n_empty_documents) > 0:
+                logger.info(f"{len(n_empty_documents)} documents were indexed: {', '.join(n_empty_documents)}")
+
+            logger.info(f'Creating indexing with Anserini at {index_path}. May take a while since stemming and '
+                        f'stopword removal is enabled...')
+
+            from jnius import autoclass
+            JIndexCollection = autoclass('io.anserini.index.IndexCollection')
+            JIndexCollection.main([
+                '-generator DefaultLuceneDocumentGenerator',
+                '-collection JsonCollection',
+                f'-input {temp_jsonl_file}',
+                f'-index {index_path}',
+                '-pretokenized false',
+                '-stemmer porter',
+                f'-threads {self.num_threads}',
+                f'-storeRaw',
+            ])
 
             os.remove(temp_jsonl_file)
         return index_path
 
     def retrieve(self, **kwargs) -> List:
         query = kwargs.get('query', None)  # type: str
+        if not query:
+            raise KeyError(f'Please provide a `query`. The args are: {kwargs}')
+
         top_k = kwargs.get('top_k', None) or self.top_k  # type: int
 
         hits = self.searcher.search(q=query, k=top_k)
         results = []
         for hit in hits:
             doc = self.searcher.doc(hit.docid)
-            results.append(Document(id=hit.docid,
-                                    score=hit.score,
-                                    text=doc.contents()))
+            results.append(Document(id=hit.docid, score=hit.score, text=doc.raw()))
         return results
