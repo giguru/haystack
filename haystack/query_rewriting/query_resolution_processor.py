@@ -22,51 +22,6 @@ __all__ = ['QuretecProcessor']
 cached_parsed_spacy_token = {}
 
 
-def get_entities(seq):
-    """Gets entities from sequence.
-
-    Args:
-        seq (list): sequence of labels.
-
-    Returns:
-        list: list of (chunk_type, index).
-
-    Example:
-        >>> seq = ['REL', 'REL', 'O', '[SEP]']
-        >>> get_entities(seq)
-        [('REL', 0), ('REL', 1), ('SEP', 3)]
-    """
-    # for nested list
-    if any(isinstance(s, list) for s in seq):
-        seq = [item for sublist in seq for item in sublist + ['O']]
-    return [(label, i) for i, label in enumerate(seq) if label != 'O']
-
-
-def f1_micro(preds, labels):
-    true_entities = set(get_entities(labels))
-    pred_entities = set(get_entities(preds))
-
-    correct = len(true_entities & pred_entities)
-    pred = len(pred_entities)
-    true = len(true_entities)
-
-    micro_precision = correct / pred if pred > 0 else 0
-    micro_recall = correct / true if true > 0 else 0
-
-    if micro_precision + micro_recall == 0:
-        micro_f1 = 0
-    else:
-        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
-    return {
-        'micro_recall': micro_recall * 100,
-        'micro_precision': micro_precision * 100,
-        'micro_f1': micro_f1 * 100
-    }
-
-
-register_metrics('f1_micro', f1_micro)
-
-
 def get_spacy_parsed_word(word: str) -> Token:
     if word not in cached_parsed_spacy_token:
         cached_parsed_spacy_token[word] = nlp(word)[0]
@@ -74,7 +29,6 @@ def get_spacy_parsed_word(word: str) -> Token:
 
 
 class QuretecProcessor(Processor):
-
     label_name_key = "question"
     gold_terms = "gold"
 
@@ -90,52 +44,23 @@ class QuretecProcessor(Processor):
     For more information on using custom datasets, please visit: https://github.com/deepset-ai/FARM/blob/master/tutorials/2_Build_a_processor_for_your_own_dataset.ipynb
     """
 
-    def __init__(self,
-                 tokenizer: BertTokenizer = None,
-                 dataset_name: Optional[str] = 'uva-irlab/canard_quretec',
-                 max_seq_len=300,
-                 train_split: str = None,
-                 test_split: str = None,
-                 dev_split: str = None,
-                 verbose: bool = True,
-                 ):
+    def __init__(self, tokenizer: BertTokenizer = None, max_seq_len=300):
         """
         :param max_seq_len. The original authors of QuReTec have provided 300 as the max sequence length.
         :param dataset_name: The processor class was designed to work with the HuggingFace dataset
                              'uva-irlab/canard_quretec'. Can be 'None' if you are using it for evaluation.
         """
-        self._verbose = verbose
-
         # Always log this, so users have a log of the settings of their experiments
         logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}")
 
-        train_filename, dev_filename, test_filename, data_dir = None, None, None, None
-        if dataset_name is not None:
-            logger.info(f"Prepare {self.__class__.__name__} with dataset {dataset_name}")
-            loaded_datasets = datasets.load_dataset(
-                dataset_name,
-                split=[
-                    f"train[{train_split}]" if train_split else 'train',
-                    f"test[{test_split}]" if test_split else 'test',
-                    f"validation[{dev_split}]" if dev_split else 'validation'
-                ],
-            )
-            self.datasets = {
-                'train': loaded_datasets[0],
-                'test': loaded_datasets[1],
-                'dev': loaded_datasets[2],
-            }
-            data_dir = os.path.dirname(self.datasets['train'].cache_files[0]['filename'])
-            train_filename = os.path.basename(self.datasets['train'].cache_files[0]['filename'])
-            test_filename = os.path.basename(self.datasets['test'].cache_files[0]['filename'])
-            dev_filename = os.path.basename(self.datasets['dev'].cache_files[0]['filename'])
-
         super(QuretecProcessor, self).__init__(tokenizer=tokenizer,
                                                max_seq_len=max_seq_len,
-                                               train_filename=train_filename,
-                                               dev_filename=dev_filename,
-                                               test_filename=test_filename,
-                                               data_dir=data_dir,
+                                               # To set the args train_filename, dev_filename, test_filename and
+                                               # data_dir, please use set_dataset
+                                               train_filename=None,
+                                               dev_filename=None,
+                                               test_filename=None,
+                                               data_dir=None,
                                                dev_split=0)
         self.add_task(name="ner",
                       metric="f1_micro",
@@ -144,6 +69,29 @@ class QuretecProcessor(Processor):
                       )
         self.label_to_id = self.label2id()
         self.id_to_label = self.id2label()
+
+    def set_dataset(self,
+                    dataset_name: Optional[str] = 'uva-irlab/canard_quretec',
+                    split: dict=None
+                    ):
+        logger.info(f"Prepare {self.__class__.__name__} with dataset {dataset_name}")
+        if split is None:
+            split = {'train': 'train', 'test': 'test', 'validation': 'validation'}
+
+        loaded_datasets = datasets.load_dataset(dataset_name, split=list(split.values()))
+        self.data_dir = os.path.dirname(loaded_datasets[0].cache_files[0]['filename'])
+        self.datasets = {}
+
+        keys = split.keys()
+        for i in range(len(split)):
+            k = keys[i]
+            self.datasets[k] = loaded_datasets[i]
+            if k == 'train':
+                self.train_filename = os.path.basename(self.datasets[k].cache_files[0]['filename'])
+            elif k == 'test':
+                self.test_filename = os.path.basename(self.datasets[k].cache_files[0]['filename'])
+            elif k == 'validation' or k == 'dev':
+                self.dev_filename = os.path.basename(self.datasets['dev'].cache_files[0]['filename'])
 
     @staticmethod
     def get_labels():
@@ -163,7 +111,7 @@ class QuretecProcessor(Processor):
     def id2label():
         return {i: label for i, label in enumerate(QuretecProcessor.get_labels())}
 
-    def pad_token_id():
+    def pad_token_id(self):
         return QuretecProcessor.get_labels().index('[PAD]')
 
     def file_to_dicts(self, file: str) -> [dict]:

@@ -1,14 +1,85 @@
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 import logging
-import numpy as np
-
+from pytrec_eval import RelevanceEvaluator
 from haystack import MultiLabel, Label
-
+from farm.evaluation.metrics import register_metrics
 from farm.evaluation.squad_evaluation import compute_f1 as calculate_f1_str
 from farm.evaluation.squad_evaluation import compute_exact as calculate_em_str
-import math
+
 
 logger = logging.getLogger(__name__)
+
+
+def get_entities(seq: list):
+    """Gets entities from sequence.
+    @param seq:
+        sequence of labels.
+    @return: list
+        list of (chunk_type, index).
+
+    Example:
+        >>> seq = ['REL', 'REL', 'O', '[SEP]']
+        >>> get_entities(seq)
+        [('REL', 0), ('REL', 1), ('SEP', 3)]
+    """
+    # for nested list
+    if any(isinstance(s, list) for s in seq):
+        seq = [item for sublist in seq for item in sublist + ['O']]
+    return [(label, i) for i, label in enumerate(seq) if label != 'O']
+
+
+def f1_micro(preds, labels):
+    true_entities = set(get_entities(labels))
+    pred_entities = set(get_entities(preds))
+
+    correct = len(true_entities & pred_entities)
+    pred = len(pred_entities)
+    true = len(true_entities)
+
+    micro_precision = correct / pred if pred > 0 else 0
+    micro_recall = correct / true if true > 0 else 0
+
+    if micro_precision + micro_recall == 0:
+        micro_f1 = 0
+    else:
+        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
+    return {
+        'micro_recall': micro_recall * 100,
+        'micro_precision': micro_precision * 100,
+        'micro_f1': micro_f1 * 100
+    }
+
+
+register_metrics('f1_micro', f1_micro)
+
+
+class EvalRewriter:
+    """
+    This is a pipeline node that should be placed after a node that returns a `query` and `original_query`, e.g.
+    Rewriter, in order to assess its performance. Performance metrics are stored in this class and updated as each
+    sample passes through it. To view the results of the evaluation, call EvalRewriter.print().
+    """
+    def __init__(self):
+        self.outgoing_edges = 1
+        self.init_counts()
+
+
+    def init_counts(self):
+        self.f1_micro = 0
+        self.query_count = 0
+
+    def run(self, **kwargs):
+        query = kwargs.get('query', None)
+        original_query = kwargs.get('original_query', None)
+        self.query_count += 1
+
+        if original_query is None or query is None:
+            raise KeyError(f'The previous component should provide both the `query` and `original_query`, but args '
+                           f'given are: {kwargs}')
+
+
+
+        return {**kwargs}, "output_1"
 
 
 class EvalDocuments:
@@ -24,15 +95,16 @@ class EvalDocuments:
                  debug: bool=False,
                  open_domain: bool=True,
                  top_k_eval_documents: int = 10,
-                 top_k_eval_documents_ndcg: int = 3,
-                 ndcg_base: int = 2,
-                 name="EvalDocuments"):
+                 metrics: dict = None,
+                 name="EvalDocuments",
+        ):
         """
         :param open_domain: When True, a document is considered correctly retrieved so long as the answer string can be found within it.
                             When False, correct retrieval is evaluated based on document_id.
         :param debug: When True, a record of each sample and its evaluation will be stored in EvalDocuments.log
         :param top_k: calculate eval metrics for top k results, e.g., recall@k
         """
+        self.metrics = metrics if metrics else {'recall', 'ndcg', 'map', 'map_cut', 'recip_rank', 'ndcg_cut.1,3'}
         self.outgoing_edges = 1
         self.init_counts()
         self.no_answer_warning = False
@@ -40,8 +112,6 @@ class EvalDocuments:
         self.log: List = []
         self.open_domain = open_domain
         self.top_k_eval_documents = top_k_eval_documents
-        self.top_k_eval_documents_ndcg = top_k_eval_documents_ndcg
-        self.ndcg_base = ndcg_base
         self.name = name
         self.too_few_docs_warning = False
         self.top_k_used = 0
@@ -63,9 +133,8 @@ class EvalDocuments:
         self.mean_average_precision = 0.0
         self.average_precision_sum = 0.0
 
-        # For NDCG
-        self.sum_ndcg_at_k = 0.0
-        self.average_ndcg_at_k = 0.0
+        # Reset sum parameters
+        self.pytrec_eval_sums = {}
 
     def run(self, documents, labels: dict, top_k_eval_documents: Optional[int]=None, **kwargs):
         """Run this node on one sample and its labels"""
@@ -88,30 +157,48 @@ class EvalDocuments:
                            f"(currently set to {top_k_eval_documents}).")
             self.too_few_docs_warning = True
 
+        qrels = kwargs.get('qrels', None)
+
         # TODO retriever_labels is currently a Multilabel object but should eventually be a RetrieverLabel object
-        # If this sample is impossible to answer and expects a no_answer response
-        if retriever_labels.no_answer:
+        pytrec_results = {}
+        if qrels:
+            qrels = {k: int(rank) for k, rank in qrels.items()}
+            query_id = 'query_id'
+            evaluator = RelevanceEvaluator({query_id: qrels}, self.metrics)
+            pytrec_results = evaluator.evaluate({query_id: {d.id: d.score for d in documents}})[query_id]
+            retrieved_reciprocal_rank = pytrec_results['recip_rank']
+            average_precision = pytrec_results['map']
+            for k, score in pytrec_results.items():
+                sum_key = f"sum_{k}"
+                if sum_key not in pytrec_results:
+                    self.pytrec_eval_sums[sum_key] = 0
+                self.pytrec_eval_sums[sum_key] += score
+
+            self.reciprocal_rank_sum += retrieved_reciprocal_rank
+            self.average_precision_sum += average_precision
+
+            correct_retrieval = True if retrieved_reciprocal_rank > 0 else False
+            self.has_answer_count += 1
+            self.has_answer_correct += int(correct_retrieval)
+            self.has_answer_reciprocal_rank_sum += retrieved_reciprocal_rank
+            self.has_answer_recall = self.has_answer_correct / self.has_answer_count
+            self.has_answer_mean_reciprocal_rank = self.has_answer_reciprocal_rank_sum / self.has_answer_count
+        elif retriever_labels.no_answer: # If this sample is impossible to answer and expects a no_answer response
             self.no_answer_count += 1
             correct_retrieval = 1
             retrieved_reciprocal_rank = 1
             self.reciprocal_rank_sum += 1
-            # For MAP
             average_precision = 1
             self.average_precision_sum += average_precision
-
-            ndcg = 1
-            self.sum_ndcg_at_k += ndcg
             if not self.no_answer_warning:
                 self.no_answer_warning = True
                 logger.warning("There seem to be empty string labels in the dataset suggesting that there "
                                "are samples with is_impossible=True. "
                                "Retrieval of these samples is always treated as correct.")
-
-
-        # If there are answer span annotations in the labels
-        else:
+        else:  # Haystack native way: If there are answer span annotations in the labels
             self.has_answer_count += 1
-            retrieved_reciprocal_rank = self.reciprocal_rank_retrieved(retriever_labels, documents, top_k_eval_documents)
+            retrieved_reciprocal_rank = self.reciprocal_rank_retrieved(retriever_labels, documents,
+                                                                       top_k_eval_documents)
             self.reciprocal_rank_sum += retrieved_reciprocal_rank
             correct_retrieval = True if retrieved_reciprocal_rank > 0 else False
             self.has_answer_correct += int(correct_retrieval)
@@ -123,15 +210,10 @@ class EvalDocuments:
             average_precision = self.average_precision_retrieved(retriever_labels, documents, top_k_eval_documents)
             self.average_precision_sum += average_precision
 
-            # For computing NDCG
-            ndcg = self.compute_ndcg(retriever_labels, documents)
-            self.sum_ndcg_at_k += ndcg
-
         self.correct_retrieval_count += correct_retrieval
         self.recall = self.correct_retrieval_count / self.query_count
         self.mean_reciprocal_rank = self.reciprocal_rank_sum / self.query_count
         self.mean_average_precision = self.average_precision_sum / self.query_count
-        self.average_ndcg_at_k = self.sum_ndcg_at_k / self.query_count
 
         self.top_k_used = top_k_eval_documents
 
@@ -140,6 +222,7 @@ class EvalDocuments:
                        "correct_retrieval": correct_retrieval,
                        "retrieved_reciprocal_rank": retrieved_reciprocal_rank,
                        "average_precision": average_precision,
+                       "pytrec_eval_results": pytrec_results,
                        **kwargs}
         if self.debug:
             self.log.append(return_dict)
@@ -147,20 +230,6 @@ class EvalDocuments:
 
     def is_correctly_retrieved(self, retriever_labels, predictions):
         return self.reciprocal_rank_retrieved(retriever_labels, predictions) > 0
-
-    def compute_ndcg(self, retriever_labels, predictions):
-        scores = predictions[0:self.top_k_eval_documents_ndcg]
-        ideal_ranking = dict(sorted(retriever_labels.items(), key=lambda x: x.score, reverse=True)[:self.top_k_eval_documents_ndcg])
-        dcg = 0
-        idcg = 0
-        for i, score in enumerate(scores):
-            if i == 0:
-                dcg += score / math.log(i+1, self.ndcg_base)
-                idcg += ideal_ranking[i] / math.log(i+1, self.ndcg_base)
-            else:
-                dcg = score
-                idcg = ideal_ranking[i]
-        return dcg / idcg if idcg > 0 else 0
 
     def reciprocal_rank_retrieved(self, retriever_labels, predictions, top_k_eval_documents):
         if self.open_domain:
@@ -204,7 +273,8 @@ class EvalDocuments:
         print(f"recall@{self.top_k_used}: {self.recall:.4f} ({self.correct_retrieval_count} / {self.query_count})")
         print(f"mean_reciprocal_rank@{self.top_k_used}: {self.mean_reciprocal_rank:.4f}")
         print(f"mean_average_precision@{self.top_k_used}: {self.mean_average_precision:.4f}")
-        print(f"ndcg@{self.top_k_eval_documents_ndcg}: {self.average_ndcg_at_k:.4f}")
+        for key, sum_score in self.pytrec_eval_sums.items():
+            print(f"{key}: {sum_score/self.query_count:.4f}")
 
 
 class EvalAnswers:

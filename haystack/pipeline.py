@@ -348,24 +348,33 @@ class Pipeline:
         with open(path, 'w') as outfile:
             yaml.dump(config, outfile, default_flow_style=False)
 
-    def eval_qrels(self, eval_component_name: str, qrels: Dict[str, list], topics: List, dump_results: bool = True):
+    def eval_qrels(self,
+                   eval_component_name: str,
+                   qrels: Dict[str, list],
+                   topics: List,
+                   dump_results: bool = True):
         results = {}
 
         for topic in topics:
             id, query = topic['qid'], topic['query']
             if id in qrels:
-                relevant_doc_ids = [docid for (docid, rank) in qrels[id].items() if int(rank) > 0]
+                topic_qrels = qrels[id]
+                relevant_doc_ids = [docid for (docid, rank) in topic_qrels.items() if int(rank) > 0]
             else:
+                topic_qrels = {}
                 relevant_doc_ids = []
+
             result = self.run(query=query,
                               history=" ".join(topic['history']),
                               id=id,
+                              qrels=topic_qrels,
                               labels={
                                   eval_component_name: MultiLabel(query,
                                                                   multiple_document_ids=relevant_doc_ids,
                                                                   multiple_answers=[],
                                                                   multiple_offset_start_in_docs=[],
                                                                   is_correct_answer=True,
+                                                                  no_answer=(len(relevant_doc_ids) == 0),
                                                                   origin="qrels",
                                                                   is_correct_document=True)
                               })
