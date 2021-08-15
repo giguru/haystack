@@ -32,6 +32,7 @@ class SparseAnseriniRetriever(BaseRetriever):
         @param num_threads: int
             Indexing anserini allows for multithreading
         """
+        logger.info(f'{self.__class__.__name__} with {searcher_config}')
         self.num_threads = num_threads
         if prebuilt_index_name is not None:
             self.searcher = SimpleSearcher.from_prebuilt_index(prebuilt_index_name)
