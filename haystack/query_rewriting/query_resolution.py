@@ -54,7 +54,7 @@ class QueryResolutionModel(BertForTokenClassification):
         self.config = config
         self._device = device
         self.prediction_heads = [QuReTecTokenClassicationHead(num_labels=config.num_labels)]
-        logger.info(f"QueryResolution model device={device}, config={config}")
+        logger.info(f"Initiated QueryResolution model device={device}, config={config}")
 
     def verify_vocab_size(self, vocab_size):
         pass
@@ -149,7 +149,8 @@ class QueryResolutionModel(BertForTokenClassification):
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, valid_ids=None, **kwargs):
         all_logits = []
         for ph in self.prediction_heads:
-            sequence_output = self.bert(input_ids, token_type_ids, attention_mask, head_mask=None)[0]
+            outputs = self.bert(input_ids, token_type_ids, attention_mask, head_mask=None)
+            sequence_output = outputs[0]
             valid_output = self.transfer_valid_output(sequence_output=sequence_output, valid_ids=valid_ids)
             sequence_output = self.dropout(valid_output).to(self._device)
             all_logits.append(self.classifier(sequence_output).to(self._device))
@@ -429,7 +430,6 @@ class QueryResolution(BaseComponent):
             batch = {key: batch[key].to(self.device) for key in batch}
             with torch.no_grad():
                 logits = self.model.forward(**batch)
-                losses_per_head = self.model.logits_to_loss_per_head(logits=logits, **batch)
                 preds_per_head = self.model.logits_to_preds(logits=logits, **batch)
                 predicted_terms = self.predictions_to_terms(batch=batch, predictions=preds_per_head[0])[0]
 

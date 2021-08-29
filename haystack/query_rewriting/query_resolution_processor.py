@@ -4,7 +4,7 @@ import logging
 import datasets
 # Use external dependency Spacy, because QuReTec also uses Spacy
 import spacy
-
+from farm.evaluation.metrics import register_metrics
 from farm.data_handler.processor import Processor
 from farm.data_handler.samples import Sample
 from farm.evaluation.metrics import register_metrics
@@ -21,6 +21,48 @@ __all__ = ['QuretecProcessor']
 
 cached_parsed_spacy_token = {}
 
+def get_entities(seq: list):
+    """Gets entities from sequence.
+    @param seq:
+        sequence of labels.
+    @return: list
+        list of (chunk_type, index).
+
+    Example:
+        >>> seq = ['REL', 'REL', 'O', '[SEP]']
+        >>> get_entities(seq)
+        [('REL', 0), ('REL', 1), ('SEP', 3)]
+    """
+    # for nested list
+    if any(isinstance(s, list) for s in seq):
+        seq = [item for sublist in seq for item in sublist + ['O']]
+    return [(label, i) for i, label in enumerate(seq) if label != 'O']
+
+
+def f1_micro(preds, labels):
+    true_entities = set(get_entities(labels))
+    pred_entities = set(get_entities(preds))
+
+    correct = len(true_entities & pred_entities)
+    pred = len(pred_entities)
+    true = len(true_entities)
+
+    micro_precision = correct / pred if pred > 0 else 0
+    micro_recall = correct / true if true > 0 else 0
+
+    if micro_precision + micro_recall == 0:
+        micro_f1 = 0
+    else:
+        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
+    return {
+        'micro_recall': micro_recall * 100,
+        'micro_precision': micro_precision * 100,
+        'micro_f1': micro_f1 * 100
+    }
+
+
+register_metrics('f1_micro', f1_micro)
+
 
 def get_spacy_parsed_word(word: str) -> Token:
     if word not in cached_parsed_spacy_token:
@@ -35,8 +77,6 @@ class QuretecProcessor(Processor):
     labels = {
         "NOT_RELEVANT": "O",
         "RELEVANT": "REL",
-        "[CLS]": "[CLS]",
-        "[SEP]": "[SEP]",
     }
     """
     Used to handle the CANARD that come in json format.
@@ -47,8 +87,6 @@ class QuretecProcessor(Processor):
     def __init__(self, tokenizer: BertTokenizer = None, max_seq_len=300):
         """
         :param max_seq_len. The original authors of QuReTec have provided 300 as the max sequence length.
-        :param dataset_name: The processor class was designed to work with the HuggingFace dataset
-                             'uva-irlab/canard_quretec'. Can be 'None' if you are using it for evaluation.
         """
         # Always log this, so users have a log of the settings of their experiments
         logger.info(f"{self.__class__.__name__} with max_seq_len={max_seq_len}")
@@ -56,7 +94,7 @@ class QuretecProcessor(Processor):
         super(QuretecProcessor, self).__init__(tokenizer=tokenizer,
                                                max_seq_len=max_seq_len,
                                                # To set the args train_filename, dev_filename, test_filename and
-                                               # data_dir, please use set_dataset
+                                               # data_dir, please use self.set_dataset
                                                train_filename=None,
                                                dev_filename=None,
                                                test_filename=None,
@@ -74,6 +112,12 @@ class QuretecProcessor(Processor):
                     dataset_name: Optional[str] = 'uva-irlab/canard_quretec',
                     split: dict=None
                     ):
+        """
+        @param dataset_name: The processor class was designed to work with the HuggingFace dataset
+                             'uva-irlab/canard_quretec'. Can be 'None' if you are using it for evaluation.
+        @param split: Split dict as accepted by datasets.load_dataset from HuggingFace datasets
+        @return:
+        """
         logger.info(f"Prepare {self.__class__.__name__} with dataset {dataset_name}")
         if split is None:
             split = {'train': 'train', 'test': 'test', 'validation': 'validation'}
@@ -160,7 +204,11 @@ class QuretecProcessor(Processor):
 
         if 'prev_questions' not in dictionary and 'history' not in dictionary:
             raise KeyError(f'Please provide a `history` or `prev_questions` key for the dict: {dictionary}')
-        history = dictionary.get('prev_questions', dictionary['history']).lower()
+
+        history = dictionary.get('prev_questions', dictionary['history'])
+        history = " ".join(history) if isinstance(history, list) else history
+        history = history.lower()
+
         gold_terms = dictionary.get('gold_terms', "")  # type: str
 
         # The authors of QuReTec by Voskarides et al. decided to separate the history and the current question
@@ -180,7 +228,7 @@ class QuretecProcessor(Processor):
             logger.warning(f"The following text could not be tokenized, likely because it contains a character that the tokenizer does not recognize: {tokenized_text}")
 
         return [
-            Sample(id=f"{dictionary['id']}",
+            Sample(id=QuretecProcessor.__get_dictionary_id(dictionary),
                    clear_text={
                        QuretecProcessor.label_name_key: question,
                        'tokenized_text': tokenized_text,
@@ -188,6 +236,10 @@ class QuretecProcessor(Processor):
                    },
                    tokenized=tokenized)
         ]
+
+    @staticmethod
+    def __get_dictionary_id(d):
+        return d['id'] if 'id' in d else 'NO-ID'
 
     def _quretec_tokenize_with_metadata(self, words_list: List[str], labellist: List[str]):
         """
@@ -231,14 +283,15 @@ class QuretecProcessor(Processor):
         """
         Convert an entry from CANARD into a Haystack Label
         """
+        doc_id = QuretecProcessor.__get_dictionary_id(d)
         return Label(
             question=d['cur_question'],
             answer=d['answer_text_with_window'],
             is_correct_answer=True,
             is_correct_document=True,
             origin=origin,
-            document_id=d['id'],
-            id=d['id'],
+            document_id=doc_id,
+            id=doc_id,
             meta=d
         )
 
@@ -291,7 +344,8 @@ class QuretecProcessor(Processor):
             valid.append(1)
             label_mask.append(0)
 
-        assert len(label_ids) == len(label_mask), f"label_ids has a different length than label_mask. label_ids={label_ids}, label_mask={label_mask}"
+        assert len(label_ids) == len(label_mask),\
+            f"label_ids has a different length than label_mask. label_ids={label_ids}, label_mask={label_mask}"
         while len(label_ids) < self.max_seq_len:
             label_ids.append(0)
             label_mask.append(0)
@@ -311,4 +365,18 @@ class QuretecProcessor(Processor):
             "valid_ids": valid,
             "label_attention_mask": label_mask,
         }]
+
+    def predictions_to_terms(self, batch: dict, predictions: List[List[str]]):
+        input_ids = batch['input_ids']
+        relevant_inputs = [input_ids[i][batch['label_attention_mask'][i] == 1].tolist() for i in range(len(input_ids))]
+
+        terms = []
+        for b in range(len(relevant_inputs)):
+            assert len(relevant_inputs[b]) == len(predictions[b])
+            terms.append([])
+            for i in range(len(predictions[b])):
+                # TODO take valid ids into account
+                if predictions[b][i] == self.labels['RELEVANT']:
+                    terms[b].append(relevant_inputs[b][i])
+        return [self.tokenizer.convert_ids_to_tokens(terms[i]) for i in range(len(terms))]
 

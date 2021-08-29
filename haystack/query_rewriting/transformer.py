@@ -1,17 +1,93 @@
 import logging
 import torch
-from typing import Any, List, Union
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from typing import Any, List, Union, Callable
 
+from farm.data_handler.processor import Processor
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForTokenClassification
+from farm.data_handler.dataloader import NamedDataLoader
 from haystack.query_rewriting.base import BaseReformulator
+from haystack.query_rewriting.query_resolution import QueryResolutionModel
+from haystack.query_rewriting.query_resolution_processor import QuretecProcessor
 
 logger = logging.getLogger(__name__)
 
 
-__all__ = ['TransformerReformulator']
+__all__ = ['GenerativeReformulator', 'ClassificationReformulator']
 
 
-class TransformerReformulator(BaseReformulator):
+class ClassificationReformulator(BaseReformulator):
+    """
+    Query reformulation can be done by classification.
+    This component was created for the model in the publication:
+    "Query Resolution for Conversational Search with Limited Supervision
+    """
+    outgoing_edges = 1
+
+    def __init__(self,
+                 processor: Processor = None,
+                 config = None,
+                 bert_model: str = 'bert-large-uncased',
+                 pretrained_model_path: str = None,
+                 use_gpu: bool = True,
+                 progress_bar: bool = True,
+                 tokenizer_args: dict = {},
+                 model_args: dict = {},
+                 ):
+
+        self.set_config(config=config, bert_model=bert_model)
+
+        # Directly store some arguments as instance properties
+        self.use_gpu = use_gpu
+        self.progress_bar = progress_bar
+
+        # Set derived instance properties
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_path, **tokenizer_args)
+        if use_gpu and torch.cuda.is_available():
+            device = 'cuda'
+            self.n_gpu = torch.cuda.device_count()
+        else:
+            device = 'cpu'
+            self.n_gpu = 1
+
+        if 'quretec' in pretrained_model_path:
+            self.model = QueryResolutionModel.from_pretrained(pretrained_model_path, device=device, config=config,
+                                                              **model_args)
+            self.processor = processor or QuretecProcessor(tokenizer=self.tokenizer, max_seq_len=300)
+        else:
+            self.model = AutoModelForTokenClassification(pretrained_model_path, config=config, device=device, **model_args)
+            self.processor = processor
+        self.device = torch.device(device)
+        self.model = self.model.to(self.device)
+
+        if self.processor is not None and not self.processor.tokenizer:
+            self.processor.tokenizer = self.tokenizer
+
+    def run_query(self, query, **kwargs):
+        self.model.connect_heads_with_processor(self.processor.tasks, require_labels=True)
+        dataset, tensor_names, problematic_samples = self.processor.dataset_from_dicts(
+            dicts=[{'query': query, **kwargs}])
+        data_loader = NamedDataLoader(dataset=dataset, batch_size=1, tensor_names=tensor_names)
+
+        for step, batch in enumerate(data_loader):
+            batch = {key: batch[key].to(self.device) for key in batch}
+            with torch.no_grad():
+                logits = self.model.forward(**batch)
+                preds_per_head = self.model.logits_to_preds(logits=logits, **batch)
+                # Right now, only one prediction head is supported
+                predicted_terms = self.processor.predictions_to_terms(batch=batch, predictions=preds_per_head[0])[0]
+
+                # The predicted terms can contain duplicates. Only get the distinct values
+                predicted_terms = list(set(predicted_terms))
+
+            output = {
+                **kwargs,
+                'original_query': query,
+                'query': f"{query} {' '.join(predicted_terms)}"
+            }
+        return output, "output_1"
+
+
+class GenerativeReformulator(BaseReformulator):
     outgoing_edges = 1
 
     def __init__(self,
@@ -22,7 +98,7 @@ class TransformerReformulator(BaseReformulator):
                  tokenizer_args: dict = {},
                  model_args: dict = {},
                  early_stopping: bool = True,
-                 history_separator: str = '|||'
+                 history_processor: Callable = None,
                  ):
         """
         Reformulate queries using transformers.
@@ -33,7 +109,6 @@ class TransformerReformulator(BaseReformulator):
           transformer_class=T5ForConditionalGeneration,
           tokenizer_class=T5Tokenizer
 
-
         @param pretrained_model_path:
         @param max_length:
         @param num_beams:
@@ -41,29 +116,34 @@ class TransformerReformulator(BaseReformulator):
         @param tokenizer_args:
         @param model_args:
         """
-
-        if use_gpu and torch.cuda.is_available():
-            device = 'cuda'
-            self.n_gpu = torch.cuda.device_count()
-        else:
-            device = 'cpu'
-            self.n_gpu = 1
+        super().__init__(use_gpu=use_gpu)
 
         self.max_length = max_length
         self.num_beams = num_beams
         self.early_stopping = early_stopping
-        self.history_separator = history_separator
+        self._history_processor = history_processor
 
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_path, **tokenizer_args)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(pretrained_model_path, **model_args)
-        self.device = torch.device(device)
         self.model = self.model.to(self.device)
+
+    def _default_history_processor(self, query: str, history: Union[str, List[str]]):
+        """
+        This default history processor was designed to be compatible with the pretrained model
+        'castorini/t5-base-canard'.
+        """
+        history_separator = '|||'
+        src_text = f" {history_separator} ".join(history) if isinstance(history, list) else history
+        src_text = f"{src_text} {history_separator} {query}"
+        return src_text
 
     def run_query(self, query: str, history: Union[str, List[str]], **kwargs):
         original_query = query
-        if len(history) > 0:
-            src_text = f" {self.history_separator} ".join(history) if isinstance(history, list) else history
-            src_text = f"{src_text} {self.history_separator} {query}"
+        if len(history) > 0:  # reformulating to include history is irrelevant when there is no history...
+            if self._history_processor:
+                src_text = self._history_processor(query=query, history=history)
+            else:
+                src_text = self._default_history_processor(query=query, history=history)
             input_ids = self.tokenizer(src_text, return_tensors="pt", add_special_tokens=True).input_ids.to(self.device)
             output_ids = self.model.generate(
                 input_ids=input_ids,
@@ -77,25 +157,18 @@ class TransformerReformulator(BaseReformulator):
                 skip_special_tokens=True,
             )
             output = {
+                **kwargs,
                 "query": rewritten_query,
                 "original_query": original_query,
-                **kwargs
             }
         else:
             output = {
+                **kwargs,
                 "query": query,
                 "original_query": query,
             }
 
         return output, "output_1"
-
-    def run(self, pipeline_type, **kwargs: Any):
-        if pipeline_type == "Query":
-            run_query_timed = self.timing(self.run_query, "query_time")
-            output, stream = run_query_timed(**kwargs)
-        else:
-            raise Exception(f"Invalid pipeline_type '{pipeline_type}'.")
-        return output, stream
 
 
 
