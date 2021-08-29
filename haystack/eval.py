@@ -2,55 +2,13 @@ from typing import List, Dict, Any, Optional
 import logging
 from pytrec_eval import RelevanceEvaluator
 from haystack import MultiLabel, Label
-from farm.evaluation.metrics import register_metrics
 from farm.evaluation.squad_evaluation import compute_f1 as calculate_f1_str
 from farm.evaluation.squad_evaluation import compute_exact as calculate_em_str
 
 
 logger = logging.getLogger(__name__)
 
-
-def get_entities(seq: list):
-    """Gets entities from sequence.
-    @param seq:
-        sequence of labels.
-    @return: list
-        list of (chunk_type, index).
-
-    Example:
-        >>> seq = ['REL', 'REL', 'O', '[SEP]']
-        >>> get_entities(seq)
-        [('REL', 0), ('REL', 1), ('SEP', 3)]
-    """
-    # for nested list
-    if any(isinstance(s, list) for s in seq):
-        seq = [item for sublist in seq for item in sublist + ['O']]
-    return [(label, i) for i, label in enumerate(seq) if label != 'O']
-
-
-def f1_micro(preds, labels):
-    true_entities = set(get_entities(labels))
-    pred_entities = set(get_entities(preds))
-
-    correct = len(true_entities & pred_entities)
-    pred = len(pred_entities)
-    true = len(true_entities)
-
-    micro_precision = correct / pred if pred > 0 else 0
-    micro_recall = correct / true if true > 0 else 0
-
-    if micro_precision + micro_recall == 0:
-        micro_f1 = 0
-    else:
-        micro_f1 = 2 * (micro_precision * micro_recall) / (micro_precision + micro_recall)
-    return {
-        'micro_recall': micro_recall * 100,
-        'micro_precision': micro_precision * 100,
-        'micro_f1': micro_f1 * 100
-    }
-
-
-register_metrics('f1_micro', f1_micro)
+SUM_PREFIX = 'sum_'
 
 
 class EvalRewriter:
@@ -163,14 +121,17 @@ class EvalDocuments:
         pytrec_results = {}
         if qrels:
             qrels = {k: int(rank) for k, rank in qrels.items()}
-            query_id = 'query_id'
+            query_id = 'q1'  # The RelevanceEvaluator wants a dictionary with query id keys. What the ID is, is irrelevant. It is just used to retrieve the results.
             evaluator = RelevanceEvaluator({query_id: qrels}, self.metrics)
-            pytrec_results = evaluator.evaluate({query_id: {d.id: d.score for d in documents}})[query_id]
+            # The run should have the format {query_id: {doc_id: rank_score}}
+            run = {query_id: {d.id: d.score for d in documents}}
+            pytrec_results = evaluator.evaluate(run)[query_id]
+
             retrieved_reciprocal_rank = pytrec_results['recip_rank']
-            average_precision = pytrec_results['map']
+            average_precision = pytrec_results['map']  # TODO MAP computed by pytrec_eval differs from Haystack's self.average_precision_retrieved...
             for k, score in pytrec_results.items():
-                sum_key = f"sum_{k}"
-                if sum_key not in pytrec_results:
+                sum_key = f"{SUM_PREFIX}{k}"
+                if sum_key not in self.pytrec_eval_sums:
                     self.pytrec_eval_sums[sum_key] = 0
                 self.pytrec_eval_sums[sum_key] += score
 
@@ -274,7 +235,7 @@ class EvalDocuments:
         print(f"mean_reciprocal_rank@{self.top_k_used}: {self.mean_reciprocal_rank:.4f}")
         print(f"mean_average_precision@{self.top_k_used}: {self.mean_average_precision:.4f}")
         for key, sum_score in self.pytrec_eval_sums.items():
-            print(f"{key}: {sum_score/self.query_count:.4f}")
+            print(f"{key.replace(SUM_PREFIX, '')}: {(sum_score/100/self.query_count):.4f}")
 
 
 class EvalAnswers:
