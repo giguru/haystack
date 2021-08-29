@@ -35,6 +35,7 @@ mmh3
 weaviate-client
 
 spacy
+pytrec-eval>=0.5
 
 # Optional: For Anserini Document Store
 pyserini==0.12.0
