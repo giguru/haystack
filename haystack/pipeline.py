@@ -24,9 +24,7 @@ from haystack.reader.base import BaseReader
 from haystack.retriever.base import BaseRetriever
 from haystack.summarizer.base import BaseSummarizer
 from haystack.translator.base import BaseTranslator
-from haystack.knowledge_graph.base import BaseKnowledgeGraph
-from haystack.graph_retriever.base import BaseGraphRetriever
-
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -351,22 +349,34 @@ class Pipeline:
     def eval_qrels(self,
                    eval_component_name: str,
                    qrels: Dict[str, list],
-                   topics: List,
+                   topics: List[dict],
                    dump_results: bool = True):
+        """
+
+        @param eval_component_name:
+        @param qrels:
+            Fictionary in form of {qid: {did: rel_score}}
+        @param topics:
+            Example format: [{'qid': string, 'query': string, 'history': string or list of strings}, ...]
+        @param dump_results:
+            Write the results to a json file.
+        @return:
+        """
         results = {}
 
-        for topic in topics:
-            id, query = topic['qid'], topic['query']
-            if id in qrels:
-                topic_qrels = qrels[id]
+        for topic in tqdm(topics, desc="Evaluating qrels...", unit="query"):
+            qid, query = topic['qid'], topic['query']
+            if qid in qrels:
+                topic_qrels = qrels[qid]
                 relevant_doc_ids = [docid for (docid, rank) in topic_qrels.items() if int(rank) > 0]
             else:
+                # It could be the case that a query has no relevant documents
                 topic_qrels = {}
                 relevant_doc_ids = []
 
             result = self.run(query=query,
                               history=" ".join(topic['history']),
-                              id=id,
+                              id=qid,
                               qrels=topic_qrels,
                               labels={
                                   eval_component_name: MultiLabel(query,
@@ -378,7 +388,7 @@ class Pipeline:
                                                                   origin="qrels",
                                                                   is_correct_document=True)
                               })
-            results[id] = [d.id for d in result['documents']]
+            results[qid] = [d.id for d in result['documents']]
 
         if dump_results:
             filename = f"result-{time.strftime('%Y%m%d-%H%M')}.json"
