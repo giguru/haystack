@@ -235,7 +235,7 @@ class EvalDocuments:
         print(f"mean_reciprocal_rank@{self.top_k_used}: {self.mean_reciprocal_rank:.4f}")
         print(f"mean_average_precision@{self.top_k_used}: {self.mean_average_precision:.4f}")
         for key, sum_score in self.pytrec_eval_sums.items():
-            print(f"{key.replace(SUM_PREFIX, '')}: {(sum_score/100/self.query_count):.4f}")
+            print(f"{key.replace(SUM_PREFIX, '')}: {(sum_score/self.query_count):.4f}")
 
 
 class EvalAnswers:
