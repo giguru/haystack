@@ -45,7 +45,7 @@ class BaseReformulator(BaseComponent):
         return {**kwargs, **output}, stream
 
     def print_time(self):
-        print("Reformulator (Speed)")
+        print("\nReformulator (Speed)")
         print("---------------")
 
         if not self.query_count:
@@ -54,3 +54,4 @@ class BaseReformulator(BaseComponent):
             print(f"Queries Performed: {self.query_count}")
             print(f"Query time: {self.reformulate_time}s")
             print(f"{self.reformulate_time / self.query_count} seconds per query")
+        print("\n")

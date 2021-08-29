@@ -231,3 +231,4 @@ class BaseRetriever(BaseComponent):
             print(f"Queries Performed: {self.query_count}")
             print(f"Query time: {self.query_time}s")
             print(f"{self.query_time / self.query_count} seconds per query")
+        print("\n")
