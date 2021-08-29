@@ -1,14 +1,14 @@
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from functools import wraps
 from time import perf_counter
 from typing import Any, Union, List
-
 import torch
-
 from haystack import BaseComponent
 
 
 class BaseReformulator(BaseComponent):
+    query_count = 0
+    reformulate_time = 0.0
 
     def __init__(self, use_gpu: bool = True):
         if use_gpu and torch.cuda.is_available():
@@ -39,6 +39,18 @@ class BaseReformulator(BaseComponent):
         pass
 
     def run(self, **kwargs: Any):
-        run_query_timed = self.timing(self.run_query, "query_time")
+        self.query_count += 1
+        run_query_timed = self.timing(self.run_query, "reformulate_time")
         output, stream = run_query_timed(**kwargs)
         return {**kwargs, **output}, stream
+
+    def print_time(self):
+        print("Reformulator (Speed)")
+        print("---------------")
+
+        if not self.query_count:
+            print("No querying performed via Reformulator.run()")
+        else:
+            print(f"Queries Performed: {self.query_count}")
+            print(f"Query time: {self.reformulate_time}s")
+            print(f"{self.reformulate_time / self.query_count} seconds per query")
