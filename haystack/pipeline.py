@@ -347,19 +347,20 @@ class Pipeline:
             yaml.dump(config, outfile, default_flow_style=False)
 
     def eval_qrels(self,
-                   eval_component_name: str,
                    qrels: Dict[str, list],
                    topics: List[dict],
+                   labels: Dict[str, MultiLabel] = None,
                    dump_results: bool = True):
         """
 
-        @param eval_component_name:
+        @param labels:
+            Use if you want to provide evaluation data to non-EvalDocuments components.
         @param qrels:
-            Fictionary in form of {qid: {did: rel_score}}
+            Dictionary in form of {qid: {did: rel_score}}
         @param topics:
             Example format: [{'qid': string, 'query': string, 'history': string or list of strings}, ...]
         @param dump_results:
-            Write the results to a json file.
+            Write the final retrieved documents to a json file.
         @return:
         """
         results = {}
@@ -368,26 +369,15 @@ class Pipeline:
             qid, query = topic['qid'], topic['query']
             if qid in qrels:
                 topic_qrels = qrels[qid]
-                relevant_doc_ids = [docid for (docid, rank) in topic_qrels.items() if int(rank) > 0]
             else:
                 # It could be the case that a query has no relevant documents
                 topic_qrels = {}
-                relevant_doc_ids = []
 
             result = self.run(query=query,
                               history=" ".join(topic['history']),
                               id=qid,
                               qrels=topic_qrels,
-                              labels={
-                                  eval_component_name: MultiLabel(query,
-                                                                  multiple_document_ids=relevant_doc_ids,
-                                                                  multiple_answers=[],
-                                                                  multiple_offset_start_in_docs=[],
-                                                                  is_correct_answer=True,
-                                                                  no_answer=(len(relevant_doc_ids) == 0),
-                                                                  origin="qrels",
-                                                                  is_correct_document=True)
-                              })
+                              labels=labels or {})
             results[qid] = [d.id for d in result['documents']]
 
         if dump_results:
