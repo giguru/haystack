@@ -1,42 +1,41 @@
 from haystack import Pipeline
-from haystack.eval import EvalDocuments
+from haystack.eval import EvalDocuments, EvalTREC
 from haystack.query_rewriting.transformer import GenerativeReformulator, ClassificationReformulator
 from haystack.retriever.anserini import SparseAnseriniRetriever
 import datasets
 
-## Load datasets
+
+# LOAD DATASETS
 topics = datasets.load_dataset('uva-irlab/trec-cast-2019-multi-turn', 'topics', split="test")
 qrels = datasets.load_dataset('uva-irlab/trec-cast-2019-multi-turn', 'qrels', split="test")
-
 # Convert into the right data format
 topics = [topic for qid, topic in enumerate(topics)]
 qrels = {d['qid']: {d['qrels']['docno'][i]: d['qrels']['relevance'][i] for i in range(len(d['qrels']['docno']))} for d in qrels}
 
-# Load components
-
-# You can either use the ClassifcationReformulator with the 'uva-irlab/quretec' model...
-# reformulator = ClassificationReformulator(pretrained_model_path="uva-irlab/quretec")
+# LOAD COMPONENTS
+# You can either use the ClassificationReformulator with the 'uva-irlab/quretec' model...
+reformulator = ClassificationReformulator(pretrained_model_path="uva-irlab/quretec")
 # or use the GenerativeReformulator with any Seq2SeqLM model
-reformulator = GenerativeReformulator(pretrained_model_path="castorini/t5-base-canard")
-
+reformulator2 = GenerativeReformulator(pretrained_model_path="castorini/t5-base-canard")
 retriever = SparseAnseriniRetriever(prebuilt_index_name='cast2019', searcher_config={"BM25": {}})
-eval_retriever = EvalDocuments(top_k_eval_documents=1000, open_domain=False)
+eval_retriever = EvalTREC(top_k_eval_documents=1000)
 
-# Build pipeline
+# BUILD PIPELINE
 p = Pipeline()
 p.add_node(component=reformulator, name="Reformulator", inputs=["Query"])
 p.add_node(component=retriever, name="Retriever", inputs=["Reformulator"])
 p.add_node(component=eval_retriever, name="EvalRetriever", inputs=["Retriever"])
 
 # Do evaluation
-p.eval_qrels(eval_component_name="EvalRetriever",
-             qrels=qrels,
-             topics=topics,
-             dump_results=True)
+p.eval_qrels(qrels=qrels, topics=topics, dump_results=True)
 
 # Print metric results
 eval_retriever.print()
 
-# Many components register execution time, so you can print the total execution times
+# Many components register execution time, so you can print the total execution times.
+# On a Macbook Pro 13 inch, 2020 with 2 GHz Quad-Core Intel Core i5, the retriever took 1.249s/query
+# the ClassificationReformulator with uva-irlab/quretec 2.282s/query and
+# the GenerativeReformulator with castorini/t5-base-canard 2.540s/query
 reformulator.print_time()
 retriever.print_time()
+exit()

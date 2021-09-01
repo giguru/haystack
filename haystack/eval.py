@@ -13,6 +13,7 @@ SUM_PREFIX = 'sum_'
 
 class EvalRewriter:
     """
+    TODO
     This is a pipeline node that should be placed after a node that returns a `query` and `original_query`, e.g.
     Rewriter, in order to assess its performance. Performance metrics are stored in this class and updated as each
     sample passes through it. To view the results of the evaluation, call EvalRewriter.print().
@@ -20,7 +21,6 @@ class EvalRewriter:
     def __init__(self):
         self.outgoing_edges = 1
         self.init_counts()
-
 
     def init_counts(self):
         self.f1_micro = 0
@@ -35,9 +35,149 @@ class EvalRewriter:
             raise KeyError(f'The previous component should provide both the `query` and `original_query`, but args '
                            f'given are: {kwargs}')
 
-
-
         return {**kwargs}, "output_1"
+
+
+class EvalTREC:
+    """
+    This is a pipeline node that should be placed after a node that returns a List of Document, e.g., Retriever or
+    Ranker, in order to assess its performance. Performance metrics are stored in this class and updated as each
+    sample passes through it. To view the results of the evaluation, call EvalTREC.print().
+    """
+
+    def __init__(self,
+                 debug: bool = False,
+                 top_k_eval_documents: int = 10,
+                 metrics: set = None,
+                 name="EvalTREC",
+                 ):
+        """
+        @param metrics
+            Please provide which metrics to use. Please consult the trec_eval documentation
+            (https://github.com/usnistgov/trec_eval) for the available metrics.
+        :param debug:
+            When True, the results for each sample and its evaluation will be stored in self.log
+        :param top_k_eval_documents:
+            calculate eval metrics for top k results
+        """
+        self.metrics = metrics if metrics else {'recall', 'ndcg', 'map', 'map_cut', 'recip_rank', 'ndcg_cut.1,3'}
+        self.outgoing_edges = 1
+        self.init_counts()
+        self.debug = debug
+        self.log: List = []
+        self.top_k_eval_documents = top_k_eval_documents
+        self.name = name
+        self.too_few_docs_warning = False
+        self.top_k_used = 0
+
+    def init_counts(self):
+        self.correct_retrieval_count = 0
+        self.query_count = 0
+        self.has_answer_count = 0
+        self.has_answer_correct = 0
+        self.has_answer_recall = 0
+        self.no_answer_count = 0
+        self.recall = 0.0
+        self.mean_reciprocal_rank = 0.0
+        self.has_answer_mean_reciprocal_rank = 0.0
+        self.reciprocal_rank_sum = 0.0
+        self.has_answer_reciprocal_rank_sum = 0.0
+
+        # For mean average precision
+        self.mean_average_precision = 0.0
+        self.average_precision_sum = 0.0
+
+        # Reset sum parameters
+        self.pytrec_eval_sums = {}
+
+    def run(self, documents, labels: dict, top_k_eval_documents: Optional[int] = None, **kwargs):
+        """Run this node on one sample and its labels"""
+        self.query_count += 1
+
+        if not top_k_eval_documents:
+            top_k_eval_documents = self.top_k_eval_documents
+
+        if not self.top_k_used:
+            self.top_k_used = top_k_eval_documents
+        elif self.top_k_used != top_k_eval_documents:
+            logger.warning(f"EvalDocuments was last run with top_k_eval_documents={self.top_k_used} but is "
+                           f"being run again with top_k_eval_documents={self.top_k_eval_documents}. "
+                           f"The evaluation counter is being reset from this point so that the evaluation "
+                           f"metrics are interpretable.")
+            self.init_counts()
+
+        if len(documents) < top_k_eval_documents and not self.too_few_docs_warning:
+            logger.warning(f"EvalDocuments is being provided less candidate documents than top_k_eval_documents "
+                           f"(currently set to {top_k_eval_documents}).")
+            self.too_few_docs_warning = True
+
+        qrels = kwargs.get('qrels', None)
+
+        qrels = {k: int(rank) for k, rank in qrels.items()}
+        # The RelevanceEvaluator wants a dictionary with query id keys. What the ID is, is irrelevant. It is just
+        # used to retrieve the results.
+        query_id = 'q1'
+        evaluator = RelevanceEvaluator({query_id: qrels}, self.metrics)
+        # The run should have the format {query_id: {doc_id: rank_score}}
+        run = {query_id: {d.id: d.score for d in documents}}
+        pytrec_results = evaluator.evaluate(run)[query_id]
+
+        retrieved_reciprocal_rank = pytrec_results['recip_rank']
+        # TODO MAP computed by pytrec_eval differs from Haystack's self.average_precision_retrieved...
+        average_precision = pytrec_results['map']
+
+        for k, score in pytrec_results.items():
+            sum_key = f"{SUM_PREFIX}{k}"
+            if sum_key not in self.pytrec_eval_sums:
+                self.pytrec_eval_sums[sum_key] = 0
+            self.pytrec_eval_sums[sum_key] += score
+
+        self.reciprocal_rank_sum += retrieved_reciprocal_rank
+        self.average_precision_sum += average_precision
+
+        correct_retrieval = True if retrieved_reciprocal_rank > 0 else False
+        self.has_answer_count += 1
+        self.has_answer_correct += int(correct_retrieval)
+        self.has_answer_reciprocal_rank_sum += retrieved_reciprocal_rank
+        self.has_answer_recall = self.has_answer_correct / self.has_answer_count
+        self.has_answer_mean_reciprocal_rank = self.has_answer_reciprocal_rank_sum / self.has_answer_count
+
+        self.correct_retrieval_count += correct_retrieval
+        self.recall = self.correct_retrieval_count / self.query_count
+        self.mean_reciprocal_rank = self.reciprocal_rank_sum / self.query_count
+        self.mean_average_precision = self.average_precision_sum / self.query_count
+
+        self.top_k_used = top_k_eval_documents
+
+        return_dict = {"documents": documents,
+                       "labels": labels,
+                       "correct_retrieval": correct_retrieval,
+                       "retrieved_reciprocal_rank": retrieved_reciprocal_rank,
+                       "average_precision": average_precision,
+                       "pytrec_eval_results": pytrec_results,
+                       **kwargs}
+        if self.debug:
+            self.log.append(return_dict)
+        return return_dict, "output_1"
+
+    def print(self):
+        """Print the evaluation results"""
+        print(self.name)
+        print("-----------------")
+        if self.no_answer_count:
+            print(
+                f"has_answer recall@{self.top_k_used}: {self.has_answer_recall:.4f} ({self.has_answer_correct}/{self.has_answer_count})")
+            print(
+                f"no_answer recall@{self.top_k_used}:  1.00 ({self.no_answer_count}/{self.no_answer_count}) (no_answer samples are always treated as correctly retrieved)")
+            print(
+                f"has_answer mean_reciprocal_rank@{self.top_k_used}: {self.has_answer_mean_reciprocal_rank:.4f}")
+            print(
+                f"no_answer mean_reciprocal_rank@{self.top_k_used}:  1.0000 (no_answer samples are always treated as correctly retrieved at rank 1)")
+        print(f"recall@{self.top_k_used}: {self.recall:.4f} ({self.correct_retrieval_count} / {self.query_count})")
+        print(f"mean_reciprocal_rank@{self.top_k_used}: {self.mean_reciprocal_rank:.4f}")
+        print(f"mean_average_precision@{self.top_k_used}: {self.mean_average_precision:.4f}")
+        for key, sum_score in self.pytrec_eval_sums.items():
+            print(f"{key.replace(SUM_PREFIX, '')}: {(sum_score / self.query_count):.4f}")
 
 
 class EvalDocuments:
@@ -53,7 +193,6 @@ class EvalDocuments:
                  debug: bool=False,
                  open_domain: bool=True,
                  top_k_eval_documents: int = 10,
-                 metrics: dict = None,
                  name="EvalDocuments",
         ):
         """
@@ -62,7 +201,6 @@ class EvalDocuments:
         :param debug: When True, a record of each sample and its evaluation will be stored in EvalDocuments.log
         :param top_k: calculate eval metrics for top k results, e.g., recall@k
         """
-        self.metrics = metrics if metrics else {'recall', 'ndcg', 'map', 'map_cut', 'recip_rank', 'ndcg_cut.1,3'}
         self.outgoing_edges = 1
         self.init_counts()
         self.no_answer_warning = False
@@ -91,13 +229,10 @@ class EvalDocuments:
         self.mean_average_precision = 0.0
         self.average_precision_sum = 0.0
 
-        # Reset sum parameters
-        self.pytrec_eval_sums = {}
-
     def run(self, documents, labels: dict, top_k_eval_documents: Optional[int]=None, **kwargs):
         """Run this node on one sample and its labels"""
         self.query_count += 1
-        retriever_labels = get_label(labels, kwargs["node_id"])
+
         if not top_k_eval_documents:
             top_k_eval_documents = self.top_k_eval_documents
 
@@ -115,36 +250,10 @@ class EvalDocuments:
                            f"(currently set to {top_k_eval_documents}).")
             self.too_few_docs_warning = True
 
-        qrels = kwargs.get('qrels', None)
-
         # TODO retriever_labels is currently a Multilabel object but should eventually be a RetrieverLabel object
-        pytrec_results = {}
-        if qrels:
-            qrels = {k: int(rank) for k, rank in qrels.items()}
-            query_id = 'q1'  # The RelevanceEvaluator wants a dictionary with query id keys. What the ID is, is irrelevant. It is just used to retrieve the results.
-            evaluator = RelevanceEvaluator({query_id: qrels}, self.metrics)
-            # The run should have the format {query_id: {doc_id: rank_score}}
-            run = {query_id: {d.id: d.score for d in documents}}
-            pytrec_results = evaluator.evaluate(run)[query_id]
-
-            retrieved_reciprocal_rank = pytrec_results['recip_rank']
-            average_precision = pytrec_results['map']  # TODO MAP computed by pytrec_eval differs from Haystack's self.average_precision_retrieved...
-            for k, score in pytrec_results.items():
-                sum_key = f"{SUM_PREFIX}{k}"
-                if sum_key not in self.pytrec_eval_sums:
-                    self.pytrec_eval_sums[sum_key] = 0
-                self.pytrec_eval_sums[sum_key] += score
-
-            self.reciprocal_rank_sum += retrieved_reciprocal_rank
-            self.average_precision_sum += average_precision
-
-            correct_retrieval = True if retrieved_reciprocal_rank > 0 else False
-            self.has_answer_count += 1
-            self.has_answer_correct += int(correct_retrieval)
-            self.has_answer_reciprocal_rank_sum += retrieved_reciprocal_rank
-            self.has_answer_recall = self.has_answer_correct / self.has_answer_count
-            self.has_answer_mean_reciprocal_rank = self.has_answer_reciprocal_rank_sum / self.has_answer_count
-        elif retriever_labels.no_answer: # If this sample is impossible to answer and expects a no_answer response
+        retriever_labels = get_label(labels, kwargs["node_id"])
+        # Haystack native way: If there are answer span annotations in the labels
+        if retriever_labels.no_answer: # If this sample is impossible to answer and expects a no_answer response
             self.no_answer_count += 1
             correct_retrieval = 1
             retrieved_reciprocal_rank = 1
@@ -156,7 +265,7 @@ class EvalDocuments:
                 logger.warning("There seem to be empty string labels in the dataset suggesting that there "
                                "are samples with is_impossible=True. "
                                "Retrieval of these samples is always treated as correct.")
-        else:  # Haystack native way: If there are answer span annotations in the labels
+        else:
             self.has_answer_count += 1
             retrieved_reciprocal_rank = self.reciprocal_rank_retrieved(retriever_labels, documents,
                                                                        top_k_eval_documents)
@@ -183,7 +292,6 @@ class EvalDocuments:
                        "correct_retrieval": correct_retrieval,
                        "retrieved_reciprocal_rank": retrieved_reciprocal_rank,
                        "average_precision": average_precision,
-                       "pytrec_eval_results": pytrec_results,
                        **kwargs}
         if self.debug:
             self.log.append(return_dict)
@@ -234,8 +342,6 @@ class EvalDocuments:
         print(f"recall@{self.top_k_used}: {self.recall:.4f} ({self.correct_retrieval_count} / {self.query_count})")
         print(f"mean_reciprocal_rank@{self.top_k_used}: {self.mean_reciprocal_rank:.4f}")
         print(f"mean_average_precision@{self.top_k_used}: {self.mean_average_precision:.4f}")
-        for key, sum_score in self.pytrec_eval_sums.items():
-            print(f"{key.replace(SUM_PREFIX, '')}: {(sum_score/self.query_count):.4f}")
 
 
 class EvalAnswers:
