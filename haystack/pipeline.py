@@ -378,7 +378,7 @@ class Pipeline:
                               id=qid,
                               qrels=topic_qrels,
                               labels=labels or {})
-            results[qid] = [d.id for d in result['documents']]
+            results[qid] = {d.id: d.score for d in result['documents']}
 
         if dump_results:
             filename = f"result-{time.strftime('%Y%m%d-%H%M')}.json"
