@@ -164,18 +164,6 @@ class EvalTREC:
         """Print the evaluation results"""
         print(self.name)
         print("-----------------")
-        if self.no_answer_count:
-            print(
-                f"has_answer recall@{self.top_k_used}: {self.has_answer_recall:.4f} ({self.has_answer_correct}/{self.has_answer_count})")
-            print(
-                f"no_answer recall@{self.top_k_used}:  1.00 ({self.no_answer_count}/{self.no_answer_count}) (no_answer samples are always treated as correctly retrieved)")
-            print(
-                f"has_answer mean_reciprocal_rank@{self.top_k_used}: {self.has_answer_mean_reciprocal_rank:.4f}")
-            print(
-                f"no_answer mean_reciprocal_rank@{self.top_k_used}:  1.0000 (no_answer samples are always treated as correctly retrieved at rank 1)")
-        print(f"recall@{self.top_k_used}: {self.recall:.4f} ({self.correct_retrieval_count} / {self.query_count})")
-        print(f"mean_reciprocal_rank@{self.top_k_used}: {self.mean_reciprocal_rank:.4f}")
-        print(f"mean_average_precision@{self.top_k_used}: {self.mean_average_precision:.4f}")
         for key, sum_score in self.pytrec_eval_sums.items():
             print(f"{key.replace(SUM_PREFIX, '')}: {(sum_score / self.query_count):.4f}")
 
