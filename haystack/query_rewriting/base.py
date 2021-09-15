@@ -10,7 +10,11 @@ class BaseReformulator(BaseComponent):
     query_count = 0
     reformulate_time = 0.0
 
-    def __init__(self, use_gpu: bool = True):
+    def __init__(self, use_gpu: bool = True, debug: bool = True):
+        self.debug = debug
+        self.log: List = []
+        self.use_gpu = use_gpu
+
         if use_gpu and torch.cuda.is_available():
             device = 'cuda'
             self.n_gpu = torch.cuda.device_count()
@@ -36,12 +40,15 @@ class BaseReformulator(BaseComponent):
 
     @abstractmethod
     def run_query(self, query: str, history: Union[str, List[str]], **kwargs):
+        raise NotImplementedError("Please implement this method in the extended class")
         pass
 
     def run(self, **kwargs: Any):
         self.query_count += 1
         run_query_timed = self.timing(self.run_query, "reformulate_time")
         output, stream = run_query_timed(**kwargs)
+        if self.debug:
+            self.log.append(output)
         return {**kwargs, **output}, stream
 
     def print_time(self):
@@ -55,3 +62,13 @@ class BaseReformulator(BaseComponent):
             print(f"Query time: {self.reformulate_time}s")
             print(f"{self.reformulate_time / self.query_count} seconds per query")
         print("\n")
+
+    def print(self):
+        print("\nReformulator Log")
+        print("---------------")
+        for output in self.log:
+            print({
+                'query': output['query'],
+                'qid': output['qid'] if 'qid' in output else '',
+                'original_query': output['original_query'],
+            })

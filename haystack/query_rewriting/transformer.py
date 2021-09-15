@@ -32,31 +32,25 @@ class ClassificationReformulator(BaseReformulator):
                  progress_bar: bool = True,
                  tokenizer_args: dict = {},
                  model_args: dict = {},
+                 debug: bool = True
                  ):
-
+        super().__init__(use_gpu=use_gpu, debug=debug)
+        self.debug = debug
         self.set_config(config=config, bert_model=bert_model)
-
         # Directly store some arguments as instance properties
-        self.use_gpu = use_gpu
         self.progress_bar = progress_bar
 
         # Set derived instance properties
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_path, **tokenizer_args)
-        if use_gpu and torch.cuda.is_available():
-            device = 'cuda'
-            self.n_gpu = torch.cuda.device_count()
-        else:
-            device = 'cpu'
-            self.n_gpu = 1
 
         if 'quretec' in pretrained_model_path:
-            self.model = QueryResolutionModel.from_pretrained(pretrained_model_path, device=device, config=config,
+            self.model = QueryResolutionModel.from_pretrained(pretrained_model_path, device=self.device, config=config,
                                                               **model_args)
             self.processor = processor or QuretecProcessor(tokenizer=self.tokenizer, max_seq_len=300)
         else:
-            self.model = AutoModelForTokenClassification(pretrained_model_path, config=config, device=device, **model_args)
+            self.model = AutoModelForTokenClassification(pretrained_model_path, config=config, device=self.device,
+                                                         **model_args)
             self.processor = processor
-        self.device = torch.device(device)
         self.model = self.model.to(self.device)
 
         if self.processor is not None and not self.processor.tokenizer:
@@ -78,11 +72,11 @@ class ClassificationReformulator(BaseReformulator):
 
                 # The predicted terms can contain duplicates. Only get the distinct values
                 predicted_terms = list(set(predicted_terms))
-
+            extended_query = f"{query} {' '.join(predicted_terms)}"
             output = {
                 **kwargs,
                 'original_query': query,
-                'query': f"{query} {' '.join(predicted_terms)}"
+                'query': extended_query
             }
         return output, "output_1"
 
@@ -99,6 +93,7 @@ class GenerativeReformulator(BaseReformulator):
                  model_args: dict = {},
                  early_stopping: bool = True,
                  history_processor: Callable = None,
+                 debug: bool = True
                  ):
         """
         Reformulate queries using transformers.
@@ -116,7 +111,7 @@ class GenerativeReformulator(BaseReformulator):
         @param tokenizer_args:
         @param model_args:
         """
-        super().__init__(use_gpu=use_gpu)
+        super().__init__(use_gpu=use_gpu, debug=debug)
 
         self.max_length = max_length
         self.num_beams = num_beams
