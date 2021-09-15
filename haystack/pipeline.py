@@ -378,7 +378,9 @@ class Pipeline:
                               id=qid,
                               qrels=topic_qrels,
                               labels=labels or {})
-            results[qid] = {d.id: d.score for d in result['documents']}
+            # The pipeline might not have a 'documents' key in the result, because the pipeline consists of only one
+            # reformulator node.
+            results[qid] = {d.id: d.score for d in result['documents']} if 'documents' in result else {}
 
         if dump_results:
             filename = f"result-{time.strftime('%Y%m%d-%H%M')}.json"
